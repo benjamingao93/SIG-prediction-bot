@@ -33,7 +33,8 @@ class ArbConfig:
     poll_seconds: float = 4.0
     basket_cooldown: float = 10.0  # let the book refresh after trading a basket
     order_ttl: int = 15  # seconds; leftover legs are cancelled right away anyway
-    repair_slippage: float = 0.02  # max overpay per share to even out a lopsided fill
+    repair_slippage: float = 0.02  # max loss per share accepted to finish hedging a lopsided fill
+    max_book_age: float = 2.0  # seconds: skip a trade whose books went stale waiting on the rate limit
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,8 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         max_capital=_f("ARB_MAX_CAPITAL", a.max_capital),
         allow_yes=os.environ.get("ARB_YES_BASKETS", "").strip().lower() in ("1", "true", "yes"),
         poll_seconds=_f("ARB_POLL_SECONDS", a.poll_seconds),
+        repair_slippage=_f("ARB_REPAIR_SLIPPAGE", a.repair_slippage),
+        max_book_age=_f("ARB_MAX_BOOK_AGE", a.max_book_age),
     )
     return Settings(
         api_key=api_key,

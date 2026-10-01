@@ -7,6 +7,8 @@
   sigbot collect [--realtime]  stage 1: record prices/books, no trading
   sigbot arb                   arbitrage: paper (logs baskets it would buy, sends nothing)
   sigbot arb --live            arbitrage with real orders (also requires MODE=live in .env)
+  sigbot hedge RACE --max-price P   have the arb bot finish hedging an uneven race (NO side)
+  sigbot dashboard             local dashboard at http://localhost:8050 (read-only)
   sigbot run                   model strategy, paper trading (logs signals, sends nothing)
   sigbot run --live            stage 4: real orders (also requires MODE=live in .env)
   sigbot backtest              stage 2: replay recorded books through the strategy
@@ -143,6 +145,50 @@ def cmd_arb(s: Settings, a) -> None:
     ArbBot(s, _client(s), DB(s.db_path), live=live).run(max_cycles=a.cycles)
 
 
+def cmd_hedge(s: Settings, a) -> None:
+    from .models.fundamentals import parse_title
+    if not a.cancel and a.max_price is None:
+        raise SystemExit("--max-price is required: the most you'll pay per share to finish the hedge")
+    db = DB(s.db_path)
+    c = _client(s)
+    ms = mk.list_tournament_markets(c, _require_slug(s), status="open")
+    legs = {}  # race key → [(exchange id, title)]
+    for m in ms:
+        p = parse_title(m.title)
+        if p and m.is_binary:
+            legs.setdefault(p[0], []).append((m.yes_exchange_id, m.title))
+    key = a.race.upper()
+    if key not in legs:  # accept "Alaska Senate" as well as "S-AK"
+        key = next((k for k, ls in legs.items() if a.race.lower() in ls[0][1].lower()), key)
+    if key not in legs:
+        raise SystemExit(f"no race matches {a.race!r}; use a key like S-AK or a name like 'Alaska Senate'")
+    if a.cancel:
+        db.delete_repair(key)
+        print(f"removed the pending repair for {key}")
+        return
+    held = {str(p.exchange_id): abs(p.quantity) for p in pf.positions(c, s.tournament_slug)
+            if p.side == "no" and not p.settled}
+    q = {ex: held.get(ex, 0.0) for ex, _ in legs[key]}
+    top = max(q.values())
+    short = [{"exchange_id": ex, "title": t, "short": top - q[ex], "cap": a.max_price}
+             for ex, t in legs[key] if top - q[ex] >= 1]
+    for ex, t in legs[key]:
+        print(f"  {t}: {q[ex]:.0f} NO held")
+    if not short:
+        print(f"{key} is already even: nothing to hedge")
+        return
+    db.save_repair(key, {"side": "no", "legs": short, "source": "manual"})
+    for l in short:
+        print(f"→ bot will buy up to {l['short']:.0f} NO on {l['title']} at ≤{a.max_price:.3f}")
+    print("The running `sigbot arb --live` picks this up next cycle (not while KILL exists).")
+
+
+def cmd_dashboard(s: Settings, a) -> None:
+    from .dashboard import serve
+    _require_slug(s)
+    serve(s, port=a.port)
+
+
 def cmd_backtest(s: Settings, a) -> None:
     from .backtest.engine import run_backtest
     from .bot import build_fundamentals
@@ -196,6 +242,9 @@ def main(argv=None) -> None:
     r.add_argument("--cycles", type=int); r.set_defaults(fn=cmd_run)
     ar = sub.add_parser("arb"); ar.add_argument("--live", action="store_true")
     ar.add_argument("--cycles", type=int); ar.set_defaults(fn=cmd_arb)
+    h = sub.add_parser("hedge"); h.add_argument("race"); h.add_argument("--max-price", type=float)
+    h.add_argument("--cancel", action="store_true"); h.set_defaults(fn=cmd_hedge)
+    d = sub.add_parser("dashboard"); d.add_argument("--port", type=int, default=8050); d.set_defaults(fn=cmd_dashboard)
     b = sub.add_parser("backtest"); b.add_argument("--bankroll", type=float, default=100_000); b.set_defaults(fn=cmd_backtest)
     sub.add_parser("report").set_defaults(fn=cmd_report)
     sub.add_parser("cancel-all").set_defaults(fn=cmd_cancel_all)

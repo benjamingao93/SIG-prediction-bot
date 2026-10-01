@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arb Bot Dashboard</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --line: #e3e6eb; --text: #14171c; --muted: #667085;
+  --accent: #2563eb; --good: #0f8a4a; --good-bg: #e7f6ee; --bad: #c4321c; --bad-bg: #fdecea;
+  --warn: #9a6500; --warn-bg: #fff4dc; --bar: #e8ebf0; --bar-fill: #9aa4b2;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1216; --panel: #171b21; --line: #262c34; --text: #e7eaee; --muted: #8b95a3;
+    --accent: #6ea0ff; --good: #3fcf86; --good-bg: #12301f; --bad: #ff7a66; --bad-bg: #3a1714;
+    --warn: #f0b84a; --warn-bg: #33270f; --bar: #232932; --bar-fill: #5b6574;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1216; --panel: #171b21; --line: #262c34; --text: #e7eaee; --muted: #8b95a3;
+  --accent: #6ea0ff; --good: #3fcf86; --good-bg: #12301f; --bad: #ff7a66; --bad-bg: #3a1714;
+  --warn: #f0b84a; --warn-bg: #33270f; --bar: #232932; --bar-fill: #5b6574;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 20px 16px 40px; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 16px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+.sub { color: var(--muted); font-size: 13px; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+  font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+.pill.live { color: var(--good); background: var(--good-bg); }
+.pill.live::before { animation: pulse 1.6s infinite; }
+.pill.paper { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.pill.down { color: var(--bad); background: var(--bad-bg); }
+@keyframes pulse { 50% { opacity: .3; } }
+.alerts { display: grid; gap: 8px; margin-bottom: 16px; }
+.alert { padding: 10px 14px; border-radius: 8px; font-weight: 500; }
+.alert.bad { background: var(--bad-bg); color: var(--bad); }
+.alert.warn { background: var(--warn-bg); color: var(--warn); }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+.kpi .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.kpi .value { font-size: 24px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+.kpi .note { color: var(--muted); font-size: 12px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.meter { height: 6px; background: var(--bar); border-radius: 3px; margin-top: 8px; overflow: hidden; }
+.meter > div { height: 100%; background: var(--accent); }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.panel h2 { font-size: 14px; margin: 0; padding: 12px 16px; border-bottom: 1px solid var(--line);
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.panel h2 span { color: var(--muted); font-weight: 400; font-size: 12px; }
+.scroll { overflow-x: auto; max-height: 460px; overflow-y: auto; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { padding: 7px 12px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+th { position: sticky; top: 0; background: var(--panel); color: var(--muted); font-weight: 500;
+  font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+td.num, th.num { text-align: right; }
+tr:last-child td { border-bottom: none; }
+.empty { padding: 24px 16px; color: var(--muted); text-align: center; }
+.tag { font-size: 11px; font-weight: 600; padding: 2px 6px; border-radius: 4px; text-transform: uppercase; }
+.tag.yes { color: var(--good); background: var(--good-bg); }
+.tag.no { color: var(--bad); background: var(--bad-bg); }
+.tag.ok { color: var(--good); background: var(--good-bg); }
+.tag.err { color: var(--bad); background: var(--bad-bg); }
+.tag.paper { color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.pos { color: var(--good); } .neg { color: var(--bad); }
+.gap { display: flex; align-items: center; gap: 8px; }
+.gapbar { position: relative; width: 110px; height: 8px; background: var(--bar); border-radius: 4px; }
+.gapbar .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--bar-fill); }
+.gapbar .fill.hot { background: var(--good); }
+.gapbar .mark { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
+.mono { font-family: var(--mono); font-size: 12px; }
+footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Arb Bot</h1>
+      <div class="sub" id="tournament">Connecting…</div>
+    </div>
+    <div class="spacer"></div>
+    <span class="pill down" id="pill">Connecting</span>
+    <span class="sub" id="updated"></span>
+  </header>
+
+  <div class="alerts" id="alerts"></div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="label">Cash</div><div class="value" id="k-cash">–</div><div class="note" id="k-cash-note"></div></div>
+    <div class="kpi"><div class="label">Account value</div><div class="value" id="k-value">–</div><div class="note" id="k-unreal"></div></div>
+    <div class="kpi"><div class="label">Capital in baskets</div><div class="value" id="k-spent">–</div><div class="note" id="k-cap"></div><div class="meter"><div id="k-meter" style="width:0"></div></div></div>
+    <div class="kpi"><div class="label">Live arb trades</div><div class="value" id="k-trades">–</div><div class="note" id="k-profit"></div></div>
+    <div class="kpi"><div class="label">Bot</div><div class="value" id="k-cycles">–</div><div class="note" id="k-uptime"></div></div>
+  </div>
+
+  <section class="panel" id="unhedged-panel" style="display:none; margin-bottom:16px; border-color: var(--bad)">
+    <h2>Unhedged races <span>NO holdings differ across a race's markets: the payout depends on who wins</span></h2>
+    <div class="scroll" id="unhedged"></div>
+  </section>
+
+  <div class="grid">
+    <section class="panel">
+      <h2>Closest to arbitrage <span id="opp-note"></span></h2>
+      <div class="scroll" id="opps"></div>
+    </section>
+    <section class="panel">
+      <h2>Bot orders <span>from the bot's log</span></h2>
+      <div class="scroll" id="orders"></div>
+    </section>
+    <section class="panel">
+      <h2>Fills <span id="fills-note">from the exchange</span></h2>
+      <div class="scroll" id="fills"></div>
+    </section>
+    <section class="panel">
+      <h2>Positions <span id="pos-note">from the exchange</span></h2>
+      <div class="scroll" id="positions"></div>
+    </section>
+  </div>
+  <footer>Bot data refreshes every 3 s; exchange data every 30 s. Read-only: stop the bot with <span class="mono">touch KILL</span>, then <span class="mono">sigbot cancel-all</span>.</footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const num = (v, d = 0) => v == null ? "–" : Number(v).toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d});
+const signed = (v, d = 2) => v == null ? "–" : `<span class="${v > 0 ? "pos" : v < 0 ? "neg" : ""}">${v > 0 ? "+" : ""}${num(v, d)}</span>`;
+const time = (iso) => { if (!iso) return "–"; const t = new Date(iso); return isNaN(t) ? esc(iso) : t.toLocaleTimeString([], {hour12: false}); };
+const day = (iso) => { const t = new Date(iso); return isNaN(t) ? "" : t.toLocaleDateString([], {month: "short", day: "numeric"}); };
+const dur = (s) => s < 60 ? `${Math.round(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
+const raceName = (t) => (t || "").replace(/^Will the \w+ Party win the /, "").replace(/\?$/, "");
+
+function table(head, rows, empty) {
+  if (!rows.length) return `<div class="empty">${empty}</div>`;
+  const th = head.map(([h, cls]) => `<th class="${cls || ""}">${h}</th>`).join("");
+  return `<table><thead><tr>${th}</tr></thead><tbody>${rows.join("")}</tbody></table>`;
+}
+
+function render(d) {
+  const L = d.local, X = d.exchange || {}, S = L.status;
+  const cur = X.tournament?.currency || "";
+  $("tournament").textContent = X.tournament?.name ? `${X.tournament.name} · ends ${day(X.tournament.end)}` : "Midterm Elections";
+
+  // status
+  const pill = $("pill");
+  if (!S) { pill.className = "pill down"; pill.textContent = "Never run"; }
+  else if (!S.running) { pill.className = "pill down"; pill.textContent = "Stopped"; }
+  else { pill.className = `pill ${S.mode}`; pill.textContent = S.mode === "live" ? "Live" : "Paper"; }
+  $("updated").textContent = S ? `bot heartbeat ${dur(S.age)} ago` : "";
+
+  // alerts
+  const alerts = [];
+  if (S && !S.running) alerts.push(["bad", `Bot is not running: last heartbeat ${dur(S.age)} ago. Start it with sigbot arb --live.`]);
+  if (!S) alerts.push(["warn", "No heartbeat yet. Restart the bot (sigbot arb --live) so it runs the version that reports to this dashboard."]);
+  if (L.kill_switch) alerts.push(["bad", "Kill switch file is present: the bot will not send new orders."]);
+  const R = L.repairs || {};
+  if (Object.keys(R).length) alerts.push(["warn", `Repair pending (the bot is finishing the hedge): ${Object.keys(R).join(", ")}`]);
+  if (S?.stale_skips) alerts.push(["warn", `${S.stale_skips} trade(s) skipped because prices went stale waiting on the rate limit.`]);
+  if (S?.last_error) alerts.push(["warn", `Last error: ${S.last_error}`]);
+  if (X.ok === false) alerts.push(["warn", `Exchange data unavailable: ${X.error}`]);
+  $("alerts").innerHTML = alerts.map(([c, m]) => `<div class="alert ${c}">${esc(m)}</div>`).join("");
+
+  // KPIs
+  $("k-cash").textContent = num(X.cash ?? S?.cash);
+  $("k-cash-note").textContent = cur;
+  $("k-value").textContent = num(X.account_value);
+  $("k-unreal").innerHTML = X.unrealized != null ? `unrealized ${signed(X.unrealized)}` : "";
+  const spent = S?.spent ?? 0, cap = S?.max_capital ?? 0;
+  $("k-spent").textContent = num(spent);
+  $("k-cap").textContent = cap ? `of ${num(cap)} cap this session` : "";
+  $("k-meter").style.width = cap ? `${Math.min(100, 100 * spent / cap)}%` : "0";
+  $("k-trades").textContent = num(L.live_trades);
+  $("k-profit").innerHTML = `planned locked profit ${signed(L.live_planned_profit)}`;
+  $("k-cycles").textContent = S ? num(S.cycles) : "–";
+  $("k-uptime").textContent = S ? `cycles · up ${dur(Date.now() / 1000 - S.started)} · ${S.baskets} races` : "";
+
+  // opportunities
+  const trigger = 1 + (S?.min_profit ?? 0.005);
+  $("opp-note").textContent = `NO basket trades when Σ bids > ${trigger.toFixed(3)}`;
+  const lo = 0.97, hi = 1.03, pct = (v) => Math.max(0, Math.min(100, 100 * (v - lo) / (hi - lo)));
+  $("opps").innerHTML = table(
+    [["Race"], ["Legs"], ["Σ bids", "num"], ["vs trigger"], ["Σ asks", "num"]],
+    (S?.opportunities || []).map((o) => {
+      const hot = o.sum_bid != null && o.sum_bid > trigger + 1e-9;
+      const bar = o.sum_bid == null ? "" :
+        `<div class="gap"><div class="gapbar"><div class="fill ${hot ? "hot" : ""}" style="width:${pct(o.sum_bid)}%"></div>` +
+        `<div class="mark" style="left:${pct(trigger)}%"></div></div>${signed(o.sum_bid - trigger, 3)}</div>`;
+      return `<tr><td>${esc(raceName(o.title))}${o.frozen ? ' <span class="tag paper">repairing</span>' : ""}</td>` +
+        `<td class="mono">${esc(o.legs)}</td><td class="num">${num(o.sum_bid, 3)}</td><td>${bar}</td>` +
+        `<td class="num">${num(o.sum_ask, 3)}</td></tr>`;
+    }),
+    S ? "No quotes yet." : "Waiting for the bot's first heartbeat.");
+
+  // bot orders
+  $("orders").innerHTML = table(
+    [["Time"], ["Race"], ["Buy"], ["Sets", "num"], ["Leg prices"], ["Profit", "num"], ["Status"]],
+    L.orders.map((o) => {
+      const st = o.mode === "paper" ? '<span class="tag paper">paper</span>' :
+        o.status === "sent" ? '<span class="tag ok">sent</span>' :
+        o.status === "repair" ? '<span class="tag paper">repair</span>' : `<span class="tag err">${esc(o.status)}</span>`;
+      return `<tr><td>${time(o.time)}</td><td>${esc(o.race)}</td><td><span class="tag ${o.side}">${esc(o.side)}</span></td>` +
+        `<td class="num">${num(o.sets)}</td><td class="mono">${o.prices.map((p) => num(p, 3)).join(" + ")}</td>` +
+        `<td class="num">${signed(o.planned_profit)}</td><td>${st}</td></tr>`;
+    }),
+    "No orders yet. Trades appear here the moment the bot sends them.");
+
+  // unhedged baskets
+  const U = X.unhedged || [];
+  const repairLeg = {};  // market title → pending repair leg
+  Object.values(R).forEach((r) => r.legs.forEach((l) => { repairLeg[l.title] = l; }));
+  $("unhedged-panel").style.display = U.length ? "" : "none";
+  $("unhedged").innerHTML = table(
+    [["Race"], ["Market"], ["NO held", "num"], ["Short", "num"], ["Bot action"]],
+    U.flatMap((u) => u.legs.map((l, i) => {
+      const rl = repairLeg[l.market];
+      const action = !l.short ? "" : rl ? `buying ${num(rl.short)} at ≤ ${num(rl.cap, 3)}${L.kill_switch ? " (paused: KILL)" : ""}`
+        : '<span class="neg">none: run sigbot hedge</span>';
+      return `<tr><td>${i ? "" : esc(u.race)}</td><td>${esc(l.market)}</td>` +
+        `<td class="num">${num(l.no_held)}</td><td class="num">${l.short ? `<span class="neg">${num(l.short)}</span>` : "–"}</td>` +
+        `<td>${action}</td></tr>`;
+    })),
+    "");
+  if (U.length) alerts.push(["bad", `${U.length} race(s) not fully hedged: see the Unhedged panel.`]);
+  $("alerts").innerHTML = alerts.map(([c, m]) => `<div class="alert ${c}">${esc(m)}</div>`).join("");
+
+  // exchange fills & positions
+  $("fills-note").textContent = X.age != null ? `from the exchange · ${dur(X.age)} ago` : "from the exchange";
+  $("pos-note").textContent = $("fills-note").textContent;
+  $("fills").innerHTML = table(
+    [["Time"], ["Market"], ["Side"], ["Qty", "num"], ["Price", "num"]],
+    (X.fills || []).map((f) => `<tr><td>${day(f.time)} ${time(f.time)}</td><td>${esc(f.market)}</td>` +
+      `<td><span class="tag ${esc((f.side || "").toLowerCase())}">${esc(f.side)}</span></td>` +
+      `<td class="num">${num(f.quantity)}</td><td class="num">${num(f.price, 3)}</td></tr>`),
+    "No fills in this tournament yet.");
+  $("positions").innerHTML = table(
+    [["Market"], ["Side"], ["Qty", "num"], ["Avg cost", "num"], ["Price", "num"], ["Unrealized", "num"]],
+    (X.positions || []).map((p) => `<tr><td>${esc(p.market)}</td><td><span class="tag ${esc(p.side)}">${esc(p.side)}</span></td>` +
+      `<td class="num">${num(p.quantity)}</td><td class="num">${num(p.avg_cost, 3)}</td>` +
+      `<td class="num">${num(p.price, 3)}</td><td class="num">${signed(p.unrealized)}</td></tr>`),
+    "No open positions.");
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api/state", {cache: "no-store"});
+    render(await r.json());
+  } catch (e) {
+    $("pill").className = "pill down";
+    $("pill").textContent = "Dashboard offline";
+    $("alerts").innerHTML = '<div class="alert bad">Can\'t reach the dashboard server. Is sigbot dashboard still running?</div>';
+  }
+}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

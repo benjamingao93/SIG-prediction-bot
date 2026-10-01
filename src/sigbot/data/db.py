@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS signals (
     p_model REAL, p_market REAL, uncertainty REAL, edge REAL,
     status TEXT, order_id TEXT, response TEXT
 );
+CREATE TABLE IF NOT EXISTS arb_repairs (
+    race TEXT PRIMARY KEY, data TEXT, created TEXT, updated TEXT
+);
+CREATE TABLE IF NOT EXISTS bot_status (
+    id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, status TEXT
+);
 CREATE TABLE IF NOT EXISTS outcomes (
     market_id TEXT PRIMARY KEY, settled_with TEXT, recorded_at TEXT
 );
@@ -101,6 +107,31 @@ class DB:
             [row.get(c) for c in cols],
         )
         self.conn.commit()
+
+    def set_status(self, status: Dict[str, Any]) -> None:
+        """The arb bot's latest heartbeat, for the dashboard. One row, overwritten each cycle."""
+        self.conn.execute("INSERT OR REPLACE INTO bot_status VALUES (1, ?, ?)", (now_iso(), json.dumps(status)))
+        self.conn.commit()
+
+    def get_repairs(self) -> Dict[str, Dict[str, Any]]:
+        """Races the arb bot holds unevenly and is still completing: race → repair."""
+        return {r["race"]: {**json.loads(r["data"]), "created": r["created"], "updated": r["updated"]}
+                for r in self.conn.execute("SELECT * FROM arb_repairs")}
+
+    def save_repair(self, race: str, data: Dict[str, Any]) -> None:
+        ts = now_iso()
+        self.conn.execute(
+            "INSERT INTO arb_repairs VALUES (?,?,?,?) ON CONFLICT(race) DO UPDATE SET data=excluded.data, updated=?",
+            (race, json.dumps(data), ts, ts, ts))
+        self.conn.commit()
+
+    def delete_repair(self, race: str) -> None:
+        self.conn.execute("DELETE FROM arb_repairs WHERE race=?", (race,))
+        self.conn.commit()
+
+    def get_status(self) -> Optional[Dict[str, Any]]:
+        r = self.conn.execute("SELECT ts, status FROM bot_status WHERE id = 1").fetchone()
+        return {"ts": r["ts"], **json.loads(r["status"])} if r else None
 
     def query(self, sql: str, params: tuple = ()) -> list:
         return self.conn.execute(sql, params).fetchall()

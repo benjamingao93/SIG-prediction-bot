@@ -5,22 +5,28 @@ top of the book get their books fetched (one read per leg). A trade is one multi
 (one write), so the budget stays far inside 100 reads / 30 writes per minute.
 
 Live execution:
-  1. POST /orders/multi-leg with every leg at the worst level walked: all placed or none.
-  2. Cancel any leg left resting (the book moved since we read it), then count its fills.
-  3. If legs filled unevenly, buy the shortfall on the short legs, at most ARB_REPAIR_SLIPPAGE
-     worse than planned. If that fails too, the basket is frozen and logged for you to fix.
+  1. Skip the trade if the books are older than ARB_MAX_BOOK_AGE by the time we'd send it: a
+     rate-limit wait can make them stale, and a stale leg rests unfilled while the others fill.
+  2. POST /orders/multi-leg with every leg at the worst level walked: all placed or none.
+  3. Cancel any leg left resting, then count its fills.
+  4. If legs filled unevenly, the shortfall becomes a repair, saved in the database. Every cycle,
+     before looking for new trades, the bot buys what it can of each shortfall from the current
+     book, up to a cap: break-even for the basket plus ARB_REPAIR_SLIPPAGE. A race with a repair
+     pending gets no new trades. `sigbot hedge` registers a repair for a gap made any other way.
+The kill switch blocks every order, repairs included.
 """
 from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 from .api import markets as mk
 from .api import orders
 from .api.client import SigAPIError, SigClient
-from .config import ArbConfig, Settings
+from .api.models import OrderBook
 from .data.db import DB
+from .config import Settings
 from .data.external.races import load_races
 from .trading import arb
 from .trading.arb import ArbOrder, Basket
@@ -36,9 +42,15 @@ class ArbBot:
         self.cash = float(self.tournament.get("myBalance") or 0)
         self.baskets: List[Basket] = []
         self.spent = 0.0
-        self.frozen: Set[str] = set()  # baskets left unbalanced: no more trades until you check
+        self.repairs: Dict[str, Dict[str, Any]] = {}
         self._last_trade: Dict[str, float] = {}
         self._last_refresh = 0.0
+        self._quotes: Dict[str, tuple] = {}
+        self.cycles = 0
+        self.trades = 0
+        self.stale_skips = 0
+        self.last_error: Optional[str] = None
+        self.started = time.time()
 
     # ---- setup ----
 
@@ -53,28 +65,47 @@ class ArbBot:
                  len(self.baskets), sum(b.exhaustive for b in self.baskets), self.cash,
                  self.spent, self.cfg.max_capital)
 
+    def _books(self, exchange_ids) -> Tuple[Dict[str, OrderBook], float]:
+        """Fresh books, and the monotonic time the first one was read."""
+        t0 = time.monotonic()
+        return {ex: mk.get_orderbook(self.client, ex, self.tid) for ex in exchange_ids}, t0
+
+    def _stale(self, read_at: float, what: str) -> bool:
+        age = time.monotonic() - read_at
+        if age > self.cfg.max_book_age:
+            self.stale_skips += 1
+            log.warning("%s skipped: books %.1fs old (limit %.1fs)", what, age, self.cfg.max_book_age)
+            return True
+        return False
+
     # ---- one cycle ----
 
     def step(self) -> int:
         """Returns the number of baskets traded."""
         if time.monotonic() - self._last_refresh > 600:
             self.refresh()
+        self.repairs = self.db.get_repairs()  # picks up `sigbot hedge` registrations too
+        if self.live and not self.s.kill_switch.exists():
+            for race in list(self.repairs):
+                self.work_repair(race)
         ex_ids = [l.exchange_id for b in self.baskets for l in b.legs]
         quotes = arb.quotes_from_prices(mk.bulk_prices(self.client, ex_ids, self.tid))
-        now = time.monotonic()
+        self._quotes = quotes
         traded = 0
         for b in self.baskets:
-            if b.key in self.frozen or now - self._last_trade.get(b.key, -1e9) < self.cfg.basket_cooldown:
+            if b.key in self.repairs:
+                continue
+            if time.monotonic() - self._last_trade.get(b.key, -1e9) < self.cfg.basket_cooldown:
                 continue
             side = arb.screen(b, quotes, self.cfg.min_profit, self.cfg.allow_yes)
             if side is None:
                 continue
-            books = {l.exchange_id: mk.get_orderbook(self.client, l.exchange_id, self.tid) for l in b.legs}
+            books, read_at = self._books([l.exchange_id for l in b.legs])
             order = arb.size(b, side, books, self.cfg.min_profit, self.cfg.max_sets)
             if order is None:
                 continue
             order = self._fit_budget(order, books)
-            if order is None:
+            if order is None or self._stale(read_at, f"arb {b.key}"):
                 continue
             self._last_trade[b.key] = time.monotonic()
             if self.execute(order):
@@ -129,12 +160,12 @@ class ArbBot:
         log.info("LIVE ARB %s → filled %s", desc, filled)
         self._log(order, "sent", results)
         if max(filled) - min(filled) >= 1:
-            self._repair(order, filled)
+            self._open_repair(order, filled)
         return True
 
     def _settle_leg(self, r: dict) -> float:
         """Cancel the leg if it is resting, then return how many shares it bought."""
-        traded = float(r.get("quantityTraded") or 0)
+        traded = abs(float(r.get("quantityTraded") or 0))
         oid = r.get("orderId")
         if not r.get("open") or oid is None:
             return traded
@@ -143,31 +174,97 @@ class ArbBot:
         except SigAPIError as e:
             log.warning("cancel %s: %s", oid, e)
         # Fills can land between placement and cancel, so count them from the fills list.
+        # NO fills come back with negative quantities.
         try:
             fills = self.client.get(f"/orders/{oid}/fills").get("data", [])
-            return max(traded, sum(float(f.get("quantity") or 0) for f in fills))
+            return max(traded, sum(abs(float(f.get("quantity") or 0)) for f in fills))
         except SigAPIError:
             return traded
 
-    def _repair(self, order: ArbOrder, filled: List[float]) -> None:
-        """Buy the shortfall on legs that filled less, within repair_slippage of the plan."""
+    # ---- repairs ----
+
+    def _open_repair(self, order: ArbOrder, filled: List[float]) -> None:
+        """Save the shortfall. Each short leg may cost up to its planned price plus the planned
+        profit per set (so completing it at the cap breaks even) plus repair_slippage."""
         b, target = order.basket, max(filled)
-        legs = []
-        for leg, px, got in zip(b.legs, order.limits, filled):
-            short = int(round(target - got))
-            if short > 0:
-                legs.append({"exchangeId": leg.exchange_id, "side": order.side, "quantity": short,
-                             "price": min(0.995, px + self.cfg.repair_slippage)})
-        log.warning("arb %s unbalanced %s: repairing %s", b.key, filled, legs)
+        profit_per_set = order.profit / order.sets
+        legs = [{"exchange_id": leg.exchange_id, "title": leg.title, "short": target - got,
+                 "cap": round(min(0.995, px + profit_per_set + self.cfg.repair_slippage), 3)}
+                for leg, px, got in zip(b.legs, order.limits, filled) if target - got >= 1]
+        repair = {"side": order.side, "legs": legs, "source": "bot"}
+        log.warning("arb %s filled unevenly %s: repair %s", b.key, filled, legs)
+        self.db.save_repair(b.key, repair)
+        self.repairs[b.key] = repair
+        self.work_repair(b.key)
+
+    def work_repair(self, race: str) -> None:
+        rep = self.repairs[race]
+        legs = [l for l in rep["legs"] if l["short"] >= 1]
+        if not legs:
+            self.db.delete_repair(race)
+            return
+        books, read_at = self._books([l["exchange_id"] for l in legs])
+        plan = []
+        for l in legs:
+            ladder = books[l["exchange_id"]].no_asks() if rep["side"] == "no" else books[l["exchange_id"]].asks
+            qty, limit = 0.0, None
+            for lvl in ladder:
+                if lvl.price > l["cap"] + 1e-9 or qty >= l["short"]:
+                    break
+                qty += lvl.quantity
+                limit = lvl.price
+            take = int(min(qty, l["short"]))
+            if take >= 1:
+                plan.append((l, take, limit))
+        if not plan:
+            log.info("repair %s: nothing on the book at or below the caps %s", race,
+                     [(l["title"], l["cap"]) for l in legs])
+            return
+        if self._stale(read_at, f"repair {race}"):
+            return
         try:
-            results = orders.place_multi_leg(self.client, legs, self.tid, ttl_seconds=self.cfg.order_ttl)
-            got = [self._settle_leg(r) for r in results]
+            results = orders.place_multi_leg(
+                self.client, [{"exchangeId": l["exchange_id"], "side": rep["side"], "quantity": take, "price": px}
+                              for l, take, px in plan], self.tid, ttl_seconds=self.cfg.order_ttl)
         except SigAPIError as e:
-            log.error("repair failed for %s: %s", b.key, e)
-            got = [0.0]
-        if any(g < l["quantity"] for g, l in zip(got, legs)):
-            self.frozen.add(b.key)
-            log.error("arb %s still unbalanced after repair: frozen. Check positions and fix by hand.", b.key)
+            log.error("repair %s rejected: %s", race, e)
+            return
+        for (l, take, px), r in zip(plan, results):
+            got = self._settle_leg(r)
+            l["short"] = max(0.0, l["short"] - got)
+            self.db.log_signal(mode="live", market_id=None, exchange_id=l["exchange_id"], side=rep["side"],
+                               action="buy", price=px, quantity=int(got), status="repair",
+                               response={"basket": race, "r": r})
+            log.info("repair %s: bought %d of %s at ≤%.3f, %.0f still short", race, got, l["title"], px, l["short"])
+        if all(l["short"] < 1 for l in rep["legs"]):
+            log.info("repair %s complete: basket hedged", race)
+            self.db.delete_repair(race)
+            del self.repairs[race]
+        else:
+            self.db.save_repair(race, rep)
+
+    # ---- dashboard heartbeat ----
+
+    def write_status(self) -> None:
+        opps = []
+        for b in self.baskets:
+            qs = [self._quotes.get(l.exchange_id, (None, None)) for l in b.legs]
+            bids, asks = [q[0] for q in qs], [q[1] for q in qs]
+            opps.append({
+                "race": b.key, "legs": "".join(l.label for l in b.legs), "title": b.legs[0].title,
+                "sum_bid": sum(bids) if all(x is not None for x in bids) else None,
+                "sum_ask": sum(asks) if all(x is not None for x in asks) else None,
+                "frozen": b.key in self.repairs,
+            })
+        opps.sort(key=lambda o: -(o["sum_bid"] or 0))
+        self.db.set_status({
+            "mode": "live" if self.live else "paper", "started": self.started, "cycles": self.cycles,
+            "trades": self.trades, "baskets": len(self.baskets), "cash": self.cash, "spent": self.spent,
+            "max_capital": self.cfg.max_capital, "min_profit": self.cfg.min_profit,
+            "poll_seconds": self.cfg.poll_seconds, "allow_yes": self.cfg.allow_yes,
+            "frozen": sorted(self.repairs), "stale_skips": self.stale_skips, "last_error": self.last_error,
+            "kill_switch": self.s.kill_switch.exists(), "opportunities": opps[:25],
+        })
 
     # ---- main loop ----
 
@@ -179,10 +276,17 @@ class ArbBot:
         while max_cycles is None or n < max_cycles:
             t0 = time.monotonic()
             try:
-                self.step()
+                self.trades += self.step()
             except SigAPIError as e:
                 log.error("cycle failed: %s", e)
-            except Exception:
+                self.last_error = f"{time.strftime('%H:%M:%S')} {e}"
+            except Exception as e:
                 log.exception("cycle failed")
+                self.last_error = f"{time.strftime('%H:%M:%S')} {type(e).__name__}: {e}"
             n += 1
+            self.cycles = n
+            try:
+                self.write_status()
+            except Exception:
+                log.exception("status write failed")
             time.sleep(max(0.0, self.cfg.poll_seconds - (time.monotonic() - t0)))

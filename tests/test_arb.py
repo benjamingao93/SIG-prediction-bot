@@ -84,36 +84,70 @@ class FakeOrders:
         self.cancelled.append(oid)
 
 
-def live_bot(monkeypatch, tmp_path, fills):
+def live_bot(monkeypatch, tmp_path, fills, books=None, fills_api=None):
+    from sigbot.data.db import DB
     fake = FakeOrders(fills)
     monkeypatch.setattr(arb_bot, "orders", fake)
+    monkeypatch.setattr(arb_bot.mk, "get_orderbook", lambda client, ex, tid: books[ex])
     bot = arb_bot.ArbBot.__new__(arb_bot.ArbBot)
     bot.s = SimpleNamespace(kill_switch=Path(tmp_path / "KILL"))
-    bot.client = SimpleNamespace(get=lambda path: {"data": []})
-    bot.db = SimpleNamespace(log_signal=lambda **kw: None)
+    bot.client = SimpleNamespace(get=lambda path: {"data": fills_api or []})
+    bot.db = DB(tmp_path / "t.db")
     bot.live, bot.cfg, bot.tid = True, ArbConfig(), "t"
-    bot.cash, bot.spent, bot.frozen = 1e6, 0.0, set()
+    bot.cash, bot.spent, bot.repairs, bot.stale_skips = 1e6, 0.0, {}, 0
     b = arb.build_baskets([market("1", "Democratic"), market("2", "Republican")])[0]
+    # planned: 100 sets at .38 + .61 = .99 → +.01 per set
     return bot, fake, arb.ArbOrder(b, "no", 100, (.38, .61), 99.0)
 
 
 def test_live_clean_fill(monkeypatch, tmp_path):
     bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 100]])
     assert bot.execute(order)
-    assert len(fake.calls) == 1 and not fake.cancelled and not bot.frozen
+    assert len(fake.calls) == 1 and not fake.cancelled
+    assert bot.db.get_repairs() == {}
     assert bot.spent == pytest.approx(99.0)
 
 
-def test_live_lopsided_fill_is_repaired(monkeypatch, tmp_path):
-    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40], [60]])
+def test_lopsided_fill_is_repaired_from_the_fresh_book(monkeypatch, tmp_path):
+    # e2 NO now costs .62 (YES bid .38): within the cap .61 + .01 profit + .02 slippage = .64
+    books = {"e2": book("e2", bids=[(.38, 1000)])}
+    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40], [60]], books)
     bot.execute(order)
     assert fake.cancelled == [1]  # resting remainder of leg 2 pulled
-    repair = fake.calls[1]
-    assert repair == [{"exchangeId": "e2", "side": "no", "quantity": 60, "price": pytest.approx(.63)}]
-    assert not bot.frozen
+    assert fake.calls[1] == [{"exchangeId": "e2", "side": "no", "quantity": 60, "price": pytest.approx(.62)}]
+    assert bot.db.get_repairs() == {}  # hedged
 
 
-def test_live_unrepairable_basket_is_frozen(monkeypatch, tmp_path):
-    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40], [10]])
+def test_repair_waits_for_a_price_under_the_cap_and_survives_restarts(monkeypatch, tmp_path):
+    books = {"e2": book("e2", bids=[(.30, 1000)])}  # NO at .70: over the .64 cap
+    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40], [60]], books)
     bot.execute(order)
-    assert bot.frozen == {"S-TX"}
+    assert len(fake.calls) == 1  # no repair order at a loss beyond the cap
+    saved = bot.db.get_repairs()["S-TX"]
+    assert saved["legs"][0]["short"] == 60 and saved["legs"][0]["cap"] == pytest.approx(.64)
+    books["e2"] = book("e2", bids=[(.37, 25), (.36, 1000)])  # NO .63 then .64
+    bot.repairs = bot.db.get_repairs()  # as a new process would load it
+    bot.work_repair("S-TX")
+    assert fake.calls[1][0]["quantity"] == 60 and fake.calls[1][0]["price"] == pytest.approx(.64)
+    assert bot.db.get_repairs() == {}
+
+
+def test_partial_repair_keeps_the_rest_pending(monkeypatch, tmp_path):
+    books = {"e2": book("e2", bids=[(.38, 1000)])}
+    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40], [25]], books)
+    bot.execute(order)
+    assert bot.db.get_repairs()["S-TX"]["legs"][0]["short"] == 35
+
+
+def test_stale_books_block_the_repair(monkeypatch, tmp_path):
+    books = {"e2": book("e2", bids=[(.38, 1000)])}
+    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40]], books)
+    bot.cfg = ArbConfig(max_book_age=-1)  # everything counts as stale
+    bot.execute(order)
+    assert len(fake.calls) == 1 and bot.stale_skips == 1
+    assert "S-TX" in bot.db.get_repairs()
+
+
+def test_late_no_fills_count_despite_negative_quantities(monkeypatch, tmp_path):
+    bot, fake, order = live_bot(monkeypatch, tmp_path, [], fills_api=[{"quantity": -30}, {"quantity": -10}])
+    assert bot._settle_leg({"orderId": 7, "open": True, "quantityTraded": 0}) == 40

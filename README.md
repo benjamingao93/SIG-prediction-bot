@@ -31,14 +31,22 @@ Each race is listed as one binary market per party, and at most one can resolve 
 YES bids across a race sum above 1, buying NO on every party locks in `Σbid − 1` per set, whoever
 wins (`trading/arb.py`). The bot screens all races from bulk prices every few seconds, walks the
 books of any race that clears `ARB_MIN_PROFIT`, and buys all legs in one atomic multi-leg order
-(`arb_bot.py`). Legs left resting are cancelled, and an uneven fill is evened out with a bounded
-repair order; if that fails the race is frozen and logged for you to fix by hand.
+(`arb_bot.py`). A trade is skipped if its books are over `ARB_MAX_BOOK_AGE` (2 s) old by send time,
+since rate-limit waits can make them stale. Legs left resting are cancelled. An uneven fill becomes a
+repair, saved in the database: every cycle the bot buys what it can of the missing legs from the
+current book, up to break-even plus `ARB_REPAIR_SLIPPAGE`, and trades nothing else in that race
+until it is hedged. For a gap made any other way: `sigbot hedge "Alaska Senate" --max-price 0.34`.
+
+`sigbot dashboard` serves a read-only view at http://localhost:8050: bot status, alerts, unhedged
+races and pending repairs, the races closest to triggering, the bot's orders, and your fills and
+positions from the exchange.
 
 YES baskets (asks summing below 1) are off by default: they lose if an unlisted candidate wins.
 
 ```bash
 sigbot arb            # paper: logs the baskets it would buy
 sigbot arb --live     # real orders; also needs MODE=live in .env
+sigbot dashboard      # http://localhost:8050
 ```
 
 ## Staged rollout
