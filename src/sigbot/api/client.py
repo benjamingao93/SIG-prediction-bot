@@ -56,6 +56,11 @@ class RateLimiter:
             self._sleep(60.0 - (now - self._hits[0]) + 0.01)
 
     @property
+    def available(self) -> int:
+        """Calls that can go out right now without waiting."""
+        return self.per_minute - self.used
+
+    @property
     def used(self) -> int:
         now = self._clock()
         return sum(1 for t in self._hits if now - t < 60.0)

@@ -100,6 +100,12 @@ def screen(basket: Basket, quotes: Dict[str, Tuple[Optional[float], Optional[flo
     return None
 
 
+def top_edge(basket: Basket, quotes: Dict[str, Tuple[Optional[float], Optional[float]]], side: str) -> float:
+    """Profit per set at the top of the book: what screen() tested."""
+    qs = [quotes[l.exchange_id] for l in basket.legs]
+    return sum(q[0] for q in qs) - 1 if side == "no" else 1 - sum(q[1] for q in qs)
+
+
 def _levels(book: OrderBook, side: str) -> List[Level]:
     return book.no_asks() if side == "no" else list(book.asks)
 

@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,7 +92,8 @@ def live_bot(monkeypatch, tmp_path, fills, books=None, fills_api=None):
     monkeypatch.setattr(arb_bot.mk, "get_orderbook", lambda client, ex, tid: books[ex])
     bot = arb_bot.ArbBot.__new__(arb_bot.ArbBot)
     bot.s = SimpleNamespace(kill_switch=Path(tmp_path / "KILL"))
-    bot.client = SimpleNamespace(get=lambda path: {"data": fills_api or []})
+    bot.client = SimpleNamespace(get=lambda path: {"data": fills_api or []},
+                                 reads=SimpleNamespace(available=100))
     bot.db = DB(tmp_path / "t.db")
     bot.live, bot.cfg, bot.tid = True, ArbConfig(), "t"
     bot.cash, bot.spent, bot.repairs, bot.stale_skips = 1e6, 0.0, {}, 0
@@ -151,3 +153,34 @@ def test_stale_books_block_the_repair(monkeypatch, tmp_path):
 def test_late_no_fills_count_despite_negative_quantities(monkeypatch, tmp_path):
     bot, fake, order = live_bot(monkeypatch, tmp_path, [], fills_api=[{"quantity": -30}, {"quantity": -10}])
     assert bot._settle_leg({"orderId": 7, "open": True, "quantityTraded": 0}) == 40
+
+
+def test_repair_waits_when_the_read_budget_is_low(monkeypatch, tmp_path):
+    books = {"e2": book("e2", bids=[(.38, 1000)])}
+    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40]], books)
+    bot.client.reads.available = 3  # only the bulk-price reserve left
+    bot.execute(order)
+    assert len(fake.calls) == 1 and bot.stale_skips == 0  # no read, no stale skip: just next cycle
+    assert bot.db.get_repairs()["S-TX"]["legs"][0]["short"] == 60
+
+
+def test_step_reads_best_edge_first_and_stops_at_the_budget(monkeypatch, tmp_path):
+    ms = [market("1", "Democratic"), market("2", "Republican"),
+          market("3", "Democratic", "Ohio Senate"), market("4", "Republican", "Ohio Senate")]
+    quotes = [{"exchangeId": "e1", "bestBid": .62, "bestAsk": .63}, {"exchangeId": "e2", "bestBid": .40, "bestAsk": .41},
+              {"exchangeId": "e3", "bestBid": .55, "bestAsk": .56}, {"exchangeId": "e4", "bestBid": .50, "bestAsk": .51}]
+    read = []
+    books = {e: book(e) for e in ("e1", "e2", "e3", "e4")}  # empty: nothing to size
+    bot, fake, _ = live_bot(monkeypatch, tmp_path, [], books)
+    monkeypatch.setattr(arb_bot.mk, "bulk_prices", lambda c, ids, tid: quotes)
+    def get_orderbook(c, ex, tid):
+        read.append(ex)
+        bot.client.reads.available -= 1
+        return books[ex]
+    monkeypatch.setattr(arb_bot.mk, "get_orderbook", get_orderbook)
+    bot.baskets = arb.build_baskets(ms)
+    bot._last_refresh, bot._last_trade, bot._quotes = time.monotonic(), {}, {}
+    bot.client.reads.available = 5  # room for one basket (2 reads) + the 3 reserved
+    bot.step()
+    assert read == ["e3", "e4"]  # Ohio (Σbid 1.05) before Texas (1.02); then the budget is spent
+    assert set(bot._last_trade) == {"S-OH"}  # Texas wasn't read, so it isn't cooling down

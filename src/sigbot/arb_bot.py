@@ -5,8 +5,11 @@ top of the book get their books fetched (one read per leg). A trade is one multi
 (one write), so the budget stays far inside 100 reads / 30 writes per minute.
 
 Live execution:
-  1. Skip the trade if the books are older than ARB_MAX_BOOK_AGE by the time we'd send it: a
-     rate-limit wait can make them stale, and a stale leg rests unfilled while the others fill.
+  1. Read a basket's books only when the read budget can take them all at once, best edge
+     first, and skip the trade anyway if they are older than ARB_MAX_BOOK_AGE by the time we'd
+     send it: a stale leg rests unfilled while the others fill. A basket whose books we read
+     waits basket_cooldown before we read them again, traded or not, so skips can't eat the
+     budget cycle after cycle.
   2. POST /orders/multi-leg with every leg at the worst level walked: all placed or none.
   3. Cancel any leg left resting, then count its fills.
   4. If legs filled unevenly, the shortfall becomes a repair, saved in the database. Every cycle,
@@ -65,6 +68,10 @@ class ArbBot:
                  len(self.baskets), sum(b.exhaustive for b in self.baskets), self.cash,
                  self.spent, self.cfg.max_capital)
 
+    def _can_read(self, n: int) -> bool:
+        """Room for n reads right now, keeping 3 back for the next cycle's bulk prices."""
+        return self.client.reads.available >= n + 3
+
     def _books(self, exchange_ids) -> Tuple[Dict[str, OrderBook], float]:
         """Fresh books, and the monotonic time the first one was read."""
         t0 = time.monotonic()
@@ -92,14 +99,20 @@ class ArbBot:
         quotes = arb.quotes_from_prices(mk.bulk_prices(self.client, ex_ids, self.tid))
         self._quotes = quotes
         traded = 0
+        flagged = []
         for b in self.baskets:
             if b.key in self.repairs:
                 continue
             if time.monotonic() - self._last_trade.get(b.key, -1e9) < self.cfg.basket_cooldown:
                 continue
             side = arb.screen(b, quotes, self.cfg.min_profit, self.cfg.allow_yes)
-            if side is None:
-                continue
+            if side is not None:
+                flagged.append((arb.top_edge(b, quotes, side), b, side))
+        for _, b, side in sorted(flagged, key=lambda f: -f[0]):
+            if not self._can_read(len(b.legs)):
+                log.debug("read budget low: leaving %s for the next cycle", b.key)
+                break
+            self._last_trade[b.key] = time.monotonic()
             books, read_at = self._books([l.exchange_id for l in b.legs])
             order = arb.size(b, side, books, self.cfg.min_profit, self.cfg.max_sets)
             if order is None:
@@ -107,7 +120,6 @@ class ArbBot:
             order = self._fit_budget(order, books)
             if order is None or self._stale(read_at, f"arb {b.key}"):
                 continue
-            self._last_trade[b.key] = time.monotonic()
             if self.execute(order):
                 traded += 1
         return traded
@@ -202,6 +214,8 @@ class ArbBot:
         legs = [l for l in rep["legs"] if l["short"] >= 1]
         if not legs:
             self.db.delete_repair(race)
+            return
+        if not self._can_read(len(legs)):
             return
         books, read_at = self._books([l["exchange_id"] for l in legs])
         plan = []
