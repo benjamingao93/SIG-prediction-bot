@@ -2,8 +2,12 @@
 
   sigbot check                 verify key, scopes, tournament; print balance
   sigbot markets               list tournament markets (+ --inputs to seed data/inputs.csv)
+  sigbot races                 rebuild data/races.csv (PVI, incumbents) from Wikipedia
+  sigbot fundamentals          fundamentals model vs market price, biggest gaps first
   sigbot collect [--realtime]  stage 1: record prices/books, no trading
-  sigbot run                   stage 3: paper trading (logs signals, sends nothing)
+  sigbot arb                   arbitrage: paper (logs baskets it would buy, sends nothing)
+  sigbot arb --live            arbitrage with real orders (also requires MODE=live in .env)
+  sigbot run                   model strategy, paper trading (logs signals, sends nothing)
   sigbot run --live            stage 4: real orders (also requires MODE=live in .env)
   sigbot backtest              stage 2: replay recorded books through the strategy
   sigbot report                signal log + calibration of recorded prices vs outcomes
@@ -64,6 +68,43 @@ def cmd_markets(s: Settings, a) -> None:
         print(f"\nadded {n} rows to {s.inputs_path} — fill in p_poll / p_forecast / group")
 
 
+def cmd_races(s: Settings, a) -> None:
+    from dataclasses import replace
+
+    from .data.external import races as rc
+    from .models.fundamentals import parse_title
+    pages = {name: rc.fetch_page(name) for name in rc.PAGES}
+    fresh = rc.parse_house(pages["house"]) + rc.parse_senate(pages["senate"]) + rc.parse_governor(pages["governor"])
+    # An Independent market means a real three-way race the model can't price: skip it.
+    ms = mk.list_tournament_markets(_client(s), _require_slug(s), status="open")
+    indep = {p[0] for p in (parse_title(m.title) for m in ms) if p and p[1] == "I"}
+    fresh = [replace(r, skip=True, notes="independent in race") if r.race in indep else r for r in fresh]
+    out = rc.merge_user_columns(fresh, rc.load_races(s.races_path))
+    rc.write_races(s.races_path, out)
+    counts = {o: sum(1 for r in out if r.office == o) for o in ("house", "senate", "governor")}
+    print(f"wrote {s.races_path}: {counts}")
+    gb = rc.parse_generic_ballot(pages["house"])
+    if gb is not None:
+        print(f"generic ballot average on Wikipedia: D{gb:+.1f}   (.env GENERIC_BALLOT_D={s.generic_ballot_d})")
+
+
+def cmd_fundamentals(s: Settings, a) -> None:
+    from .bot import build_fundamentals
+    fm = build_fundamentals(s)
+    if fm is None:
+        raise SystemExit("needs data/races.csv (`sigbot races`) and GENERIC_BALLOT_D in .env")
+    rows = []
+    for m in mk.list_tournament_markets(_client(s), _require_slug(s), status="open"):
+        p = fm.p_yes(m.title)
+        last = m.exchanges[0].latest_price if m.exchanges else None
+        if p is not None and last is not None:
+            rows.append((p - last, p, last, m.title))
+    rows.sort(key=lambda r: -abs(r[0]))
+    print(f"env D{fm.env:+.1f}   model  market   gap")
+    for gap, p, last, title in rows[:a.top]:
+        print(f"  {p:6.3f}  {last:6.3f}  {gap:+6.3f}  {title}")
+
+
 def cmd_collect(s: Settings, a) -> None:
     from .data.collector import Collector
     c, db = _client(s), DB(s.db_path)
@@ -91,11 +132,24 @@ def cmd_run(s: Settings, a) -> None:
     Bot(s, _client(s), DB(s.db_path), live=live).run(max_cycles=a.cycles)
 
 
+def cmd_arb(s: Settings, a) -> None:
+    from .arb_bot import ArbBot
+    live = a.live
+    if live and s.mode != "live":
+        raise SystemExit("--live also requires MODE=live in .env. Refusing to send orders.")
+    _require_slug(s)
+    if live:
+        print("LIVE ARBITRAGE — create a file named", s.kill_switch, "to stop new orders.")
+    ArbBot(s, _client(s), DB(s.db_path), live=live).run(max_cycles=a.cycles)
+
+
 def cmd_backtest(s: Settings, a) -> None:
     from .backtest.engine import run_backtest
+    from .bot import build_fundamentals
     from .data.external.inputs import load_inputs
     from .models.ensemble import Ensemble
-    res = run_backtest(DB(s.db_path), Ensemble(), load_inputs(s.inputs_path), s.risk, bankroll=a.bankroll)
+    model = Ensemble(s.market_weight, fundamentals=build_fundamentals(s))
+    res = run_backtest(DB(s.db_path), model, load_inputs(s.inputs_path), s.risk, bankroll=a.bankroll)
     for t in res.trades[-20:]:
         print(t)
     print(res.summary())
@@ -134,10 +188,14 @@ def main(argv=None) -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check").set_defaults(fn=cmd_check)
     m = sub.add_parser("markets"); m.add_argument("--inputs", action="store_true"); m.set_defaults(fn=cmd_markets)
+    sub.add_parser("races").set_defaults(fn=cmd_races)
+    f = sub.add_parser("fundamentals"); f.add_argument("--top", type=int, default=60); f.set_defaults(fn=cmd_fundamentals)
     c = sub.add_parser("collect"); c.add_argument("--realtime", action="store_true")
     c.add_argument("--cycles", type=int); c.set_defaults(fn=cmd_collect)
     r = sub.add_parser("run"); r.add_argument("--live", action="store_true")
     r.add_argument("--cycles", type=int); r.set_defaults(fn=cmd_run)
+    ar = sub.add_parser("arb"); ar.add_argument("--live", action="store_true")
+    ar.add_argument("--cycles", type=int); ar.set_defaults(fn=cmd_arb)
     b = sub.add_parser("backtest"); b.add_argument("--bankroll", type=float, default=100_000); b.set_defaults(fn=cmd_backtest)
     sub.add_parser("report").set_defaults(fn=cmd_report)
     sub.add_parser("cancel-all").set_defaults(fn=cmd_cancel_all)

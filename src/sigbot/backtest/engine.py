@@ -43,6 +43,7 @@ def run_backtest(db: DB, model: ProbabilityModel, inputs: Dict[str, RaceInputs],
     last_trade: Dict[str, datetime] = {}
     last_mid: Dict[str, float] = {}
     market_of: Dict[str, str] = {}
+    titles = {r["market_id"]: r["title"] or "" for r in db.query("SELECT market_id, title FROM markets")}
 
     for r in db.query("SELECT * FROM book_snapshots ORDER BY ts"):
         ts = datetime.fromisoformat(r["ts"])
@@ -55,7 +56,7 @@ def run_backtest(db: DB, model: ProbabilityModel, inputs: Dict[str, RaceInputs],
         lt = last_trade.get(book.exchange_id)
         if lt is not None and (ts - lt).total_seconds() < cooldown_s:
             continue
-        ctx = MarketContext(book.market_id, "", book.mid, inputs.get(book.market_id), None,
+        ctx = MarketContext(book.market_id, titles.get(book.market_id, ""), book.mid, inputs.get(book.market_id), None,
                             ts.replace(tzinfo=ts.tzinfo or timezone.utc))
         est = model.predict(ctx)
         if est is None:

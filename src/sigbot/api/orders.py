@@ -52,6 +52,36 @@ def place_limit(
     return client.post("/orders", body)
 
 
+def place_multi_leg(
+    client: SigClient,
+    legs: List[Dict[str, Any]],
+    tournament_id: str,
+    ttl_seconds: Optional[int] = 30,
+    idempotency_key: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Up to 10 limit buys, atomically: every leg is placed or none is. Placement is atomic,
+    fills are not: a leg whose limit no longer crosses the book rests (`open: true`).
+    legs: [{"exchangeId", "side", "quantity", "price"}]. Returns per-leg result data, in order."""
+    if not 1 <= len(legs) <= 10:
+        raise ValueError("multi-leg orders take 1-10 legs")
+    exp = None
+    if ttl_seconds:
+        exp = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(timespec="milliseconds")
+        exp = exp.replace("+00:00", "Z")
+    body_legs = []
+    for leg in legs:
+        if leg["quantity"] <= 0:
+            raise ValueError("quantity must be positive")
+        b = {"exchangeId": str(leg["exchangeId"]), "side": leg["side"], "action": "buy",
+             "quantity": int(leg["quantity"]), "price": round_to_tick(leg["price"], "buy"),
+             "tournamentId": tournament_id}
+        if exp:
+            b["expirationDate"] = exp
+        body_legs.append(b)
+    resp = client.post("/orders/multi-leg", {"idempotencyKey": idempotency_key or str(uuid.uuid4()), "legs": body_legs})
+    return [r.get("data") or {} for r in sorted(resp.get("results", []), key=lambda r: r.get("index", 0))]
+
+
 def cancel(client: SigClient, order_id: int) -> Any:
     return client.delete(f"/orders/{order_id}")
 
@@ -64,4 +94,4 @@ def cancel_all(client: SigClient, tournament_id: str, market_id: Optional[str] =
 
 
 def open_orders(client: SigClient, tournament_id: str) -> List[Dict[str, Any]]:
-    return list(client.paginate("/orders", status="open", tournamentId=tournament_id, limit=200))
+    return list(client.paginate("/orders", status="open", tournamentId=tournament_id, limit=100))

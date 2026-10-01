@@ -25,13 +25,29 @@ cp .env.example .env              # then paste your API key into .env
 Get a key on the site under **My Profile → API Keys** with the `read` + `trade` scopes. You also need to
 confirm your email, register for the tournament and accept the current Terms, or every call returns 403.
 
+## Arbitrage: `sigbot arb`
+
+Each race is listed as one binary market per party, and at most one can resolve YES. When the
+YES bids across a race sum above 1, buying NO on every party locks in `Σbid − 1` per set, whoever
+wins (`trading/arb.py`). The bot screens all races from bulk prices every few seconds, walks the
+books of any race that clears `ARB_MIN_PROFIT`, and buys all legs in one atomic multi-leg order
+(`arb_bot.py`). Legs left resting are cancelled, and an uneven fill is evened out with a bounded
+repair order; if that fails the race is frozen and logged for you to fix by hand.
+
+YES baskets (asks summing below 1) are off by default: they lose if an unlisted candidate wins.
+
+```bash
+sigbot arb            # paper: logs the baskets it would buy
+sigbot arb --live     # real orders; also needs MODE=live in .env
+```
+
 ## Staged rollout
 
 | Stage | Command | Sends orders? |
 |---|---|---|
 | 0. Verify | `sigbot check`: prints your tournaments; put the slug in `.env` | no |
 | 1. Collect | `sigbot collect`: logs prices + books to `data/sig.db`. **Start this first and leave it running.** | no |
-| 2. Views | `sigbot markets --inputs`, then fill in `data/inputs.csv` | no |
+| 2. Views | `sigbot races` builds `data/races.csv` for the fundamentals model; set `GENERIC_BALLOT_D`. Check it with `sigbot fundamentals`. Optionally add polls/forecasts: `sigbot markets --inputs`, then fill in `data/inputs.csv` | no |
 | 3. Paper | `sigbot run`: logs what it *would* trade to the `signals` table | no |
 | 4. Backtest | `sigbot backtest` replays the recorded books; `sigbot report` | no |
 | 5. Live | set `MODE=live` in `.env` **and** run `sigbot run --live` | **yes** |
@@ -47,15 +63,42 @@ share the account's rate limit.
 |---|---|
 | `p_poll` | P(YES) from your polling model (`0.72` or `72%`) |
 | `p_forecast` | P(YES) from a published forecast |
-| `group` | correlation bucket (`senate`, `house-pa`, …); `MAX_GROUP_EXPOSURE` caps each bucket |
+| `group` | correlation bucket (`senate`, `house-pa`, …); `MAX_GROUP_EXPOSURE` caps each bucket. If blank, the office (`house`/`senate`/`governor`/`chamber`) is used |
 
-If both probabilities are blank, the bot has no view on that market and won't trade it. The file is reloaded
+If both probabilities are blank, the fundamentals model is the only view on that market. The file is reloaded
 every minute while the bot runs.
+
+## Fundamentals model: `data/races.csv`
+
+`sigbot races` pulls every 2026 House, Senate and Governor race from Wikipedia: Cook PVI, the
+incumbent's party, whether they're running, their last result, and which parties have a nominee.
+`models/fundamentals.py` turns that into a probability:
+
+```
+expected Dem margin = beta·2·PVI + gamma·GENERIC_BALLOT_D ± incumbency + margin_adj
+P(Dem wins)         = Φ(margin / sqrt(race_sd² + national_sd²))
+```
+
+- An incumbent keeps half of how far they beat the expected margin last time (their personal
+  vote), or gets a flat bonus if there's no comparable last result.
+- Governor races get a smaller weight on the national environment (`gamma` = 0.6) because they
+  follow the national mood less.
+- The U.S. House and U.S. Senate control markets come from all 435 and 35 races, linked by a
+  shared national error.
+- Races with an Independent market, or without both a D and an R nominee, are skipped.
+
+The parameters are reasoned priors, not fitted. The model knows nothing about specific candidates,
+so the biggest gaps against the market (`sigbot fundamentals`) are usually candidate effects the
+market already prices. For each race you have a view on, put your adjustment in `margin_adj`
+(points, Dem-positive) or set `skip=1`. Rebuilding keeps those columns, and the bot reloads the
+file while it runs. The fundamentals probability counts as one more source next to `p_poll` and
+`p_forecast`.
 
 ## How a trade is decided
 
-1. `p_c = 0.7·p_market + 0.3·p_external` (`models/ensemble.py`). Swap in fitted logistic coefficients once
-   markets settle.
+1. `p_c = w·p_market + (1−w)·p_external`, with `w = MARKET_WEIGHT` (0.7) and `p_external` the log-odds average
+   of `p_poll`, `p_forecast` and the fundamentals model (`models/ensemble.py`). Swap in fitted logistic
+   coefficients once markets settle.
 2. Walk the book (`trading/signals.py`): buy YES by lifting asks, or buy NO by hitting YES bids at `1 − bid`. A
    level is only taken while `p_side − price > MIN_EDGE + UNCERTAINTY_MULT·uncertainty`.
 3. Size with ¼-Kelly, `f* = (p − q)/(1 − q)` (`trading/sizing.py`).
@@ -80,8 +123,8 @@ every minute while the bot runs.
 src/sigbot/
   config.py            settings from .env
   api/                 client (auth, rate limit, retries), markets, orders, portfolio, realtime
-  data/                SQLite store, collector, external inputs loader
-  models/              market prior, external view, ensemble, calibration
+  data/                SQLite store, collector, inputs + races (Wikipedia) loaders
+  models/              market prior, fundamentals, external view, ensemble, calibration
   trading/             signals, sizing, risk, execution, arb (relationship violations)
   backtest/engine.py   replay recorded books
   bot.py               main loop

@@ -11,13 +11,15 @@ from typing import Optional, Sequence, Tuple
 
 from .base import Estimate, MarketContext, logit, sigmoid
 from .external import ExternalModel
+from .fundamentals import FundamentalsModel
 
 
 class Ensemble:
-    def __init__(self, w_market: float = 0.7, coefs: Optional[Sequence[float]] = None):
+    def __init__(self, w_market: float = 0.7, coefs: Optional[Sequence[float]] = None,
+                 fundamentals: Optional[FundamentalsModel] = None):
         self.w_market = w_market
         self.coefs = list(coefs) if coefs else None
-        self.external = ExternalModel()
+        self.external = ExternalModel(fundamentals)
 
     @staticmethod
     def features(ctx: MarketContext) -> Optional[Tuple[float, float, float, float]]:
@@ -32,8 +34,8 @@ class Ensemble:
         ext = self.external.predict(ctx)
         if ext is None or ctx.p_market is None:
             return None  # no outside view → no opinion → no trade
-        if self.coefs:
-            x = self.features(ctx)
+        x = self.features(ctx) if self.coefs else None
+        if x is not None:
             b = self.coefs
             z = b[0] + sum(bi * xi for bi, xi in zip(b[1:], x))
             p = sigmoid(z)

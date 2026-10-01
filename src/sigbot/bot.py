@@ -16,6 +16,7 @@ from .data.db import DB
 from .data.external.inputs import RaceInputs, load_inputs
 from .models.base import MarketContext, ProbabilityModel
 from .models.ensemble import Ensemble
+from .models.fundamentals import FundamentalsModel
 from .trading import signals, sizing
 from .trading.execution import Executor
 from .trading.risk import RiskManager
@@ -35,6 +36,17 @@ def days_until(iso: Optional[str], now: datetime) -> Optional[float]:
     return max(0.0, (t - now).total_seconds() / 86400)
 
 
+def build_fundamentals(s: Settings) -> Optional[FundamentalsModel]:
+    """None unless data/races.csv exists (`sigbot races`) and GENERIC_BALLOT_D is set."""
+    if s.generic_ballot_d is None:
+        log.warning("GENERIC_BALLOT_D not set: fundamentals model off")
+        return None
+    if not s.races_path.exists():
+        log.warning("%s missing (run `sigbot races`): fundamentals model off", s.races_path)
+        return None
+    return FundamentalsModel.from_file(s.races_path, s.generic_ballot_d)
+
+
 class Bot:
     def __init__(self, settings: Settings, client: SigClient, db: DB, live: bool,
                  model: Optional[ProbabilityModel] = None, sync_interval: float = 60.0):
@@ -44,7 +56,8 @@ class Bot:
         self.tournament = mk.get_tournament(client, settings.tournament_slug)
         tid = self.tournament["id"]
         self.collector = Collector(client, db, settings.tournament_slug, tid)
-        self.model = model or Ensemble()
+        self.fundamentals = build_fundamentals(settings)
+        self.model = model or Ensemble(settings.market_weight, fundamentals=self.fundamentals)
         self.risk = RiskManager(settings.risk, settings.kill_switch)
         self.executor = Executor(client, db, tid, live=live)
         self.sync_interval = sync_interval
@@ -54,11 +67,20 @@ class Bot:
         self._last_sync = 0.0
 
     def group_of(self) -> Dict[str, str]:
-        return {mid: i.group for mid, i in self.inputs.items()}
+        """Your group from inputs.csv, else the office (house/senate/governor/chamber)."""
+        out = {}
+        for mid, m in self.collector.markets.items():
+            g = self.fundamentals.group(m.title) if self.fundamentals else None
+            if g:
+                out[mid] = g
+        out.update({mid: i.group for mid, i in self.inputs.items() if i.group != "ungrouped"})
+        return out
 
     def sync(self) -> None:
         """Authoritative refresh of balance, positions and your inputs file."""
         self.inputs = load_inputs(self.s.inputs_path)
+        if self.fundamentals and self.fundamentals.refresh():
+            log.info("reloaded %s", self.s.races_path)
         t = mk.get_tournament(self.client, self.s.tournament_slug)
         self.cash = float(t.get("myBalance") or 0)
         positions = pf.positions(self.client, self.s.tournament_slug)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -24,6 +25,18 @@ class RiskLimits:
 
 
 @dataclass(frozen=True)
+class ArbConfig:
+    min_profit: float = 0.005  # locked profit per basket set, in SUSQies: one tick
+    max_sets: int = 2000  # per order
+    max_capital: float = 50_000.0  # total cost of baskets bought per session
+    allow_yes: bool = False  # YES baskets assume one listed party wins: not riskless
+    poll_seconds: float = 4.0
+    basket_cooldown: float = 10.0  # let the book refresh after trading a basket
+    order_ttl: int = 15  # seconds; leftover legs are cancelled right away anyway
+    repair_slippage: float = 0.02  # max overpay per share to even out a lopsided fill
+
+
+@dataclass(frozen=True)
 class Settings:
     api_key: str
     base_url: str
@@ -31,13 +44,17 @@ class Settings:
     mode: str
     db_path: Path
     inputs_path: Path
+    races_path: Path
+    generic_ballot_d: Optional[float]  # national environment for the fundamentals model; None = off
+    market_weight: float  # weight on the market price vs your outside view
     kill_switch: Path
     read_budget: int
     write_budget: int
     risk: RiskLimits
+    arb: ArbConfig
 
 
-def _f(name: str, default: float) -> float:
+def _f(name: str, default: Optional[float]) -> Optional[float]:
     v = os.environ.get(name)
     return float(v) if v not in (None, "") else default
 
@@ -61,6 +78,14 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         min_edge=_f("MIN_EDGE", d.min_edge),
         uncertainty_mult=_f("UNCERTAINTY_MULT", d.uncertainty_mult),
     )
+    a = ArbConfig()
+    arb = ArbConfig(
+        min_profit=_f("ARB_MIN_PROFIT", a.min_profit),
+        max_sets=int(_f("ARB_MAX_SETS", a.max_sets)),
+        max_capital=_f("ARB_MAX_CAPITAL", a.max_capital),
+        allow_yes=os.environ.get("ARB_YES_BASKETS", "").strip().lower() in ("1", "true", "yes"),
+        poll_seconds=_f("ARB_POLL_SECONDS", a.poll_seconds),
+    )
     return Settings(
         api_key=api_key,
         base_url=os.environ.get("SIG_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -68,8 +93,12 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         mode=mode,
         db_path=Path(os.environ.get("DB_PATH", "data/sig.db")),
         inputs_path=Path(os.environ.get("INPUTS_PATH", "data/inputs.csv")),
+        races_path=Path(os.environ.get("RACES_PATH", "data/races.csv")),
+        generic_ballot_d=_f("GENERIC_BALLOT_D", None),
+        market_weight=_f("MARKET_WEIGHT", 0.7),
         kill_switch=Path(os.environ.get("KILL_SWITCH", "KILL")),
         read_budget=int(_f("READ_BUDGET", 80)),
         write_budget=int(_f("WRITE_BUDGET", 25)),
         risk=risk,
+        arb=arb,
     )

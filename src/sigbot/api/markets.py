@@ -17,7 +17,7 @@ def list_tournaments(client: SigClient) -> List[Dict[str, Any]]:
 
 
 def list_tournament_markets(client: SigClient, slug: str, status: Optional[str] = None) -> List[Market]:
-    return [Market.from_api(m) for m in client.paginate(f"/tournaments/{slug}/markets", status=status, limit=200)]
+    return [Market.from_api(m) for m in client.paginate(f"/tournaments/{slug}/markets", status=status, limit=100)]
 
 
 def get_orderbook(client: SigClient, exchange_id: str, tournament_id: str, depth: int = 20) -> OrderBook:

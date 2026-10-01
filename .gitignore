@@ -8,3 +8,5 @@ data/*.db
 data/*.db-*
 data/inputs.csv
 KILL
+data/races.csv
+*.log
