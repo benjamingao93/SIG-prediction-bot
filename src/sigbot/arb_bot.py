@@ -250,7 +250,7 @@ class ArbBot:
         try:
             results = orders.place_multi_leg(
                 self.client, [{"exchangeId": l["exchange_id"], "side": rep["side"], "quantity": take, "price": px}
-                              for l, take, px in plan], self.tid, ttl_seconds=self.cfg.order_ttl)
+                              for l, take, px in plan], self.tid, ttl_seconds=self.cfg.repair_ttl)
         except SigAPIError as e:
             log.error("repair %s rejected: %s", race, e)
             return

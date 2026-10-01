@@ -32,7 +32,8 @@ class ArbConfig:
     allow_yes: bool = False  # YES baskets assume one listed party wins: not riskless
     poll_seconds: float = 4.0
     basket_cooldown: float = 10.0  # let the book refresh after trading a basket
-    order_ttl: int = 15  # seconds; leftover legs are cancelled right away anyway
+    order_ttl: int = 15  # seconds: a new basket that can't execute this fast should expire
+    repair_ttl: int = 120  # repairs are capped at break-even, so they can wait out a slow exchange
     repair_slippage: float = 0.02  # max loss per share accepted to finish hedging a lopsided fill
     max_book_age: float = 2.0  # seconds: skip a trade whose books went stale waiting on the rate limit
 
