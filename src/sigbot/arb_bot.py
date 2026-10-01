@@ -13,7 +13,7 @@ Live execution:
   2. POST /orders/multi-leg with every leg at the worst level walked: all placed or none.
   3. Cancel any leg left resting, then count its fills.
   4. If legs filled unevenly, the shortfall becomes a repair, saved in the database. Every cycle,
-     before looking for new trades, the bot buys what it can of each shortfall from the current
+     before looking for new trades, the bot buys what it can of each shortfall from the latest
      book, up to a cap: break-even for the basket plus ARB_REPAIR_SLIPPAGE. A race with a repair
      pending gets no new trades. `sigbot hedge` registers a repair for a gap made any other way.
 The kill switch blocks every order, repairs included.
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from .api import markets as mk
@@ -73,9 +74,19 @@ class ArbBot:
         return self.client.reads.available >= n + 3
 
     def _books(self, exchange_ids) -> Tuple[Dict[str, OrderBook], float]:
-        """Fresh books, and the monotonic time the first one was read."""
-        t0 = time.monotonic()
-        return {ex: mk.get_orderbook(self.client, ex, self.tid) for ex in exchange_ids}, t0
+        """Fresh books, read in parallel so a slow exchange costs one round trip, not one per
+        leg, and the monotonic time the first of them arrived (the age that matters)."""
+        ids = list(exchange_ids)
+        arrived: Dict[str, float] = {}
+
+        def read(ex):
+            book = mk.get_orderbook(self.client, ex, self.tid)
+            arrived[ex] = time.monotonic()
+            return book
+
+        with ThreadPoolExecutor(max_workers=max(1, len(ids))) as pool:
+            books = dict(zip(ids, pool.map(read, ids)))
+        return books, min(arrived.values())
 
     def _stale(self, read_at: float, what: str) -> bool:
         age = time.monotonic() - read_at
@@ -217,7 +228,9 @@ class ArbBot:
             return
         if not self._can_read(len(legs)):
             return
-        books, read_at = self._books([l["exchange_id"] for l in legs])
+        # No freshness check here: every leg's limit is at or under its cap, so a stale book can
+        # only mean the order doesn't fill, never that it overpays.
+        books, _ = self._books([l["exchange_id"] for l in legs])
         plan = []
         for l in legs:
             ladder = books[l["exchange_id"]].no_asks() if rep["side"] == "no" else books[l["exchange_id"]].asks
@@ -233,8 +246,6 @@ class ArbBot:
         if not plan:
             log.info("repair %s: nothing on the book at or below the caps %s", race,
                      [(l["title"], l["cap"]) for l in legs])
-            return
-        if self._stale(read_at, f"repair {race}"):
             return
         try:
             results = orders.place_multi_leg(

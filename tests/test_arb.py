@@ -141,13 +141,13 @@ def test_partial_repair_keeps_the_rest_pending(monkeypatch, tmp_path):
     assert bot.db.get_repairs()["S-TX"]["legs"][0]["short"] == 35
 
 
-def test_stale_books_block_the_repair(monkeypatch, tmp_path):
+def test_repairs_go_ahead_on_slow_books_because_the_cap_bounds_the_price(monkeypatch, tmp_path):
     books = {"e2": book("e2", bids=[(.38, 1000)])}
-    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40]], books)
+    bot, fake, order = live_bot(monkeypatch, tmp_path, [[100, 40], [60]], books)
     bot.cfg = ArbConfig(max_book_age=-1)  # everything counts as stale
     bot.execute(order)
-    assert len(fake.calls) == 1 and bot.stale_skips == 1
-    assert "S-TX" in bot.db.get_repairs()
+    assert len(fake.calls) == 2 and fake.calls[1][0]["price"] <= .64
+    assert bot.db.get_repairs() == {}
 
 
 def test_late_no_fills_count_despite_negative_quantities(monkeypatch, tmp_path):

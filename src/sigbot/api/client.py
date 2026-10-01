@@ -5,6 +5,7 @@ GET/HEAD are reads; everything else is a write.
 """
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from typing import Any, Callable, Deque, Dict, Iterator, Optional
@@ -44,16 +45,19 @@ class RateLimiter:
         self._clock = clock
         self._sleep = sleep
         self._hits: Deque[float] = deque()
+        self._lock = threading.Lock()  # the arb bot reads books from several threads
 
     def acquire(self) -> None:
         while True:
-            now = self._clock()
-            while self._hits and now - self._hits[0] >= 60.0:
-                self._hits.popleft()
-            if len(self._hits) < self.per_minute:
-                self._hits.append(now)
-                return
-            self._sleep(60.0 - (now - self._hits[0]) + 0.01)
+            with self._lock:
+                now = self._clock()
+                while self._hits and now - self._hits[0] >= 60.0:
+                    self._hits.popleft()
+                if len(self._hits) < self.per_minute:
+                    self._hits.append(now)
+                    return
+                wait = 60.0 - (now - self._hits[0]) + 0.01
+            self._sleep(wait)
 
     @property
     def available(self) -> int:
