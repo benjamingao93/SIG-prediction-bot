@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigbot"
+version = "0.1.0"
+description = "Automated trading bot for the Susquehanna Predictions Cup (thesuper.market API)"
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+realtime = ["supabase>=2.10"]
+ml = ["numpy>=1.26", "pandas>=2.0", "scikit-learn>=1.4"]
+dev = ["pytest>=8", "respx>=0.21"]
+
+[project.scripts]
+sigbot = "sigbot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
