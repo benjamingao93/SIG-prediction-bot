@@ -1,15 +1,17 @@
 """Local dashboard: `sigbot dashboard`, then open http://localhost:8050.
 
 Read-only. Bot activity comes from data/sig.db (the arb bot's per-cycle heartbeat and its order
-log), which costs no API reads. Exchange data (balance, P&L, positions, fills) is fetched at
-most once per 30 s however many tabs are open, on a small read budget of its own, so the
-dashboard can't starve the bot of the account's 100 reads/minute.
+log), which costs no API reads. Exchange data (balance, P&L, positions, fills) is refreshed by a
+background thread every 30 s on a small read budget of its own, so the dashboard can't starve the
+bot of the account's 100 reads/minute, and a slow or rate-limited refresh never holds up a page
+load: requests always get the latest cached copy.
 """
 from __future__ import annotations
 
 import json
 import logging
 import re
+import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -44,14 +46,22 @@ class ExchangeCache:
         self.race_legs: Dict[str, List[str]] = {}  # race → exchange ids of its party markets
         self.titles_fetched = 0.0
 
+    def start(self) -> None:
+        def loop():
+            while True:
+                self._refresh()
+                time.sleep(self.ttl)
+        threading.Thread(target=loop, daemon=True, name="exchange-refresh").start()
+
     def get(self) -> Dict[str, Any]:
         with self.lock:
-            if time.time() - self.fetched > self.ttl:
-                self._refresh()
+            if not self.fetched:
+                return {"loading": True}
             return {**self.data, "age": round(time.time() - self.fetched)}
 
     def _refresh(self) -> None:
         slug = self.s.tournament_slug
+        data = dict(self.data)
         try:
             if time.time() - self.titles_fetched > 600:
                 ms = mk.list_tournament_markets(self.client, slug)
@@ -65,7 +75,7 @@ class ExchangeCache:
             pnl = self.client.get(f"/tournaments/{slug}/portfolio/pnl", period="all")
             pos = self.client.get(f"/tournaments/{slug}/portfolio/positions").get("positions", [])
             fills = self.client.get(f"/tournaments/{slug}/portfolio/fills", limit=100).get("data", [])
-            self.data = {
+            data = {
                 "ok": True,
                 "unhedged": unhedged(pos, self.race_legs, self.titles),
                 "tournament": {"name": t.get("name"), "end": t.get("endDate"), "currency": t.get("currencyName")},
@@ -88,8 +98,9 @@ class ExchangeCache:
             }
         except Exception as e:  # keep serving the last good data
             log.warning("exchange refresh failed: %s", e)
-            self.data = {**self.data, "ok": False, "error": str(e)}
-        self.fetched = time.time()
+            data = {**data, "ok": False, "error": str(e)}
+        with self.lock:
+            self.data, self.fetched = data, time.time()
 
 
 def unhedged(positions: List[Dict[str, Any]], race_legs: Dict[str, List[str]],
@@ -149,6 +160,7 @@ def serve(s: Settings, port: int = 8050) -> None:
     db = DB(s.db_path)
     db_lock = threading.Lock()
     ex = ExchangeCache(s)
+    ex.start()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -164,18 +176,32 @@ def serve(s: Settings, port: int = 8050) -> None:
                 self._send(404, "text/plain", b"not found")
 
         def _send(self, code: int, ctype: str, body: bytes) -> None:
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the browser closed the tab or gave up: nothing to do
 
         def log_message(self, *args):  # quiet
             pass
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"dashboard on http://localhost:{port}  (Ctrl-C to stop)")
+    class Server6(ThreadingHTTPServer):
+        address_family = socket.AF_INET6
+
+    # Loopback only, on IPv4 and IPv6: browsers may resolve "localhost" to either.
+    servers = [ThreadingHTTPServer(("127.0.0.1", port), Handler)]
     try:
-        httpd.serve_forever()
+        servers.append(Server6(("::1", port), Handler))
+    except OSError:
+        pass
+    for srv in servers[1:]:
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"dashboard on http://localhost:{port}  (or http://127.0.0.1:{port})  Ctrl-C to stop")
+    try:
+        servers[0].serve_forever()
     finally:
-        httpd.server_close()
+        for srv in servers:
+            srv.server_close()

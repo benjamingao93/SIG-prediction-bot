@@ -165,6 +165,7 @@ function render(d) {
   if (Object.keys(R).length) alerts.push(["warn", `Repair pending (the bot is finishing the hedge): ${Object.keys(R).join(", ")}`]);
   if (S?.stale_skips) alerts.push(["warn", `${S.stale_skips} trade(s) skipped because prices went stale waiting on the rate limit.`]);
   if (S?.last_error) alerts.push(["warn", `Last error: ${S.last_error}`]);
+  if (X.loading) alerts.push(["warn", "Loading exchange data (balance, positions, fills)…"]);
   if (X.ok === false) alerts.push(["warn", `Exchange data unavailable: ${X.error}`]);
   $("alerts").innerHTML = alerts.map(([c, m]) => `<div class="alert ${c}">${esc(m)}</div>`).join("");
 
@@ -248,14 +249,22 @@ function render(d) {
     "No open positions.");
 }
 
+let inFlight = false;
 async function tick() {
+  if (inFlight) return;  // never stack requests behind a slow one
+  inFlight = true;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 8000);
   try {
-    const r = await fetch("/api/state", {cache: "no-store"});
+    const r = await fetch("/api/state", {cache: "no-store", signal: ctl.signal});
     render(await r.json());
   } catch (e) {
     $("pill").className = "pill down";
     $("pill").textContent = "Dashboard offline";
     $("alerts").innerHTML = '<div class="alert bad">Can\'t reach the dashboard server. Is sigbot dashboard still running?</div>';
+  } finally {
+    clearTimeout(timer);
+    inFlight = false;
   }
 }
 tick();
