@@ -74,6 +74,8 @@ class ArbBot:
         self.feed = None
         self.feed_hits = self.feed_misses = 0
         self._wake = threading.Event()  # set by the feed thread when your account gets fills
+        self._cycle_started: Optional[float] = None  # wall time the current cycle began
+        self._alive_stop = threading.Event()
         if self.cfg.feed:
             from .api.realtime import FeedRunner
             # Shares this client, so its reloads count against the same budget; keep 10 free.
@@ -112,6 +114,8 @@ class ArbBot:
         self.held = arb.held_baskets(self.baskets, no_held)
         self.held_cost = {b.key: sum(avg.get(l.exchange_id, 0.0) for l in b.legs)
                           for b in self.baskets if b.key in self.held}
+        # What's actually in baskets now, so ARB_MAX_CAPITAL also counts baskets from earlier runs.
+        self.spent = sum(self.held[r] * c for r, c in self.held_cost.items())
         self._positions_at = time.monotonic()
 
     def _can_read(self, n: int) -> bool:
@@ -215,7 +219,7 @@ class ArbBot:
                 break
             self._last_trade[b.key] = time.monotonic()
             books, read_at = self._books([l.exchange_id for l in b.legs])
-            order = arb.size(b, side, books, self.cfg.min_profit, self.cfg.max_sets)
+            order = arb.size(b, side, books, self.cfg.min_profit, self.cfg.max_sets, self.cfg.depth_fraction)
             if order is None:
                 continue
             order = self._fit_budget(order, books)
@@ -255,7 +259,8 @@ class ArbBot:
                 break
             self._last_trade[b.key] = time.monotonic()
             books, read_at = self._books([l.exchange_id for l in b.legs])
-            order = arb.size_exit(b, books, sets, self._exit_bar(b), self.cfg.max_sets, self.held_cost.get(b.key))
+            order = arb.size_exit(b, books, sets, self._exit_bar(b), self.cfg.max_sets, self.held_cost.get(b.key),
+                                  self.cfg.depth_fraction)
             if order is None or self._stale(read_at, f"exit {b.key}"):
                 continue
             if self.execute_exit(order):
@@ -274,7 +279,7 @@ class ArbBot:
         if sets <= 0:
             log.info("arb %s skipped: no capital left (room %.0f)", order.basket.key, room)
             return None
-        return arb.size(order.basket, order.side, books, self.cfg.min_profit, sets)
+        return arb.size(order.basket, order.side, books, self.cfg.min_profit, sets, self.cfg.depth_fraction)
 
     # ---- execution ----
 
@@ -503,18 +508,32 @@ class ArbBot:
             call_patiently(self.client, self.quoter.startup, "clearing leftover quotes")
         if self.feed is not None:
             self.feed.start_in_thread()
+        threading.Thread(target=self._alive_loop, daemon=True, name="alive").start()
         try:
             self._loop(max_cycles)
         finally:
+            self._alive_stop.set()
             if self.quoter:
                 self.quoter.cancel_all("bot stopping")
             if self.feed is not None:
                 self.feed.stop()
 
+    def _alive_loop(self) -> None:
+        """Every 10 s, independent of the trading loop: proof of life for the dashboard. On a slow
+        exchange one cycle can take minutes, and the per-cycle heartbeat alone looks like a crash."""
+        db = DB(self.s.db_path)  # own connection: this runs on another thread
+        while not self._alive_stop.is_set():
+            try:
+                db.set_alive(self._cycle_started, self.cycles, "live" if self.live else "paper")
+            except Exception:
+                log.debug("alive write failed", exc_info=True)
+            self._alive_stop.wait(10)
+
     def _loop(self, max_cycles: Optional[int]) -> None:
         n = 0
         while max_cycles is None or n < max_cycles:
             t0 = time.monotonic()
+            self._cycle_started = time.time()
             try:
                 self.trades += self.step()
             except SigAPIError as e:
@@ -525,6 +544,7 @@ class ArbBot:
                 self.last_error = f"{time.strftime('%H:%M:%S')} {type(e).__name__}: {e}"
             n += 1
             self.cycles = n
+            self._cycle_started = None
             try:
                 self.write_status()
             except Exception:

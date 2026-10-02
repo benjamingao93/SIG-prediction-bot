@@ -171,7 +171,7 @@ def test_kill_switch_cancels_everything_and_places_nothing(monkeypatch, tmp_path
 def test_size_capped_by_hedge_depth(monkeypatch, tmp_path):
     q, bot, fake, _, _ = make(monkeypatch, tmp_path, live=True, hedge_depth=75)
     q.step(Q, {})
-    assert fake.placed[0][3] == 75
+    assert fake.placed[0][3] == 37  # half of the 75 shown (ARB_DEPTH_FRACTION 0.5)
 
 
 def test_startup_cancels_leftovers_and_hedges_their_fills(monkeypatch, tmp_path):

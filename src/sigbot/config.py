@@ -28,14 +28,18 @@ class RiskLimits:
 class ArbConfig:
     min_profit: float = 0.005  # locked profit per basket set, in SUSQies: one tick
     max_sets: int = 2000  # per order
-    max_capital: float = 50_000.0  # total cost of baskets bought per session
+    max_capital: float = 50_000.0  # most that may sit in baskets at once (cost basis)
     allow_yes: bool = False  # YES baskets assume one listed party wins: not riskless
     exit_enabled: bool = True  # sell held NO baskets when that beats holding to settlement
     exit_early: bool = True  # ...or as soon as selling locks in exit_min_profit over cost
-    exit_min_profit: float = 0.005  # per set, over cost
+    exit_min_profit: float = 0.0025  # per set, over cost: low, so capital comes back early
     poll_seconds: float = 4.0
     basket_cooldown: float = 10.0  # let the book refresh after trading a basket
-    order_ttl: int = 15  # seconds: a new basket that can't execute this fast should expire
+    order_ttl: int = 15  # seconds an order may wait at the exchange before it expires unexecuted.
+    # Short on purpose: an order the exchange reaches late is priced off old books, which is when
+    # one leg fills and another misses (a repair). Expiring unfilled is the safe outcome.
+    depth_fraction: float = 0.5  # use at most this share of each shown book level, so a leg
+    # still fills if someone takes part of the level first
     repair_ttl: int = 120  # repairs are capped at break-even, so they can wait out a slow exchange
     repair_slippage: float = 0.02  # max loss per share accepted to finish hedging a lopsided fill
     max_book_age: float = 2.0  # seconds: skip a trade whose books went stale waiting on the rate limit
@@ -104,6 +108,8 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         poll_seconds=_f("ARB_POLL_SECONDS", a.poll_seconds),
         repair_slippage=_f("ARB_REPAIR_SLIPPAGE", a.repair_slippage),
         max_book_age=_f("ARB_MAX_BOOK_AGE", a.max_book_age),
+        order_ttl=int(_f("ARB_ORDER_TTL", a.order_ttl)),
+        depth_fraction=_f("ARB_DEPTH_FRACTION", a.depth_fraction),
         feed_markets=int(_f("ARB_FEED_MARKETS", a.feed_markets)),
         quote_races=int(_f("ARB_QUOTE_RACES", a.quote_races)),
         quote_size=int(_f("ARB_QUOTE_SIZE", a.quote_size)),

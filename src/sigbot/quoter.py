@@ -268,7 +268,7 @@ class Quoter:
         if not self.bot._can_read(len(hedge_ex)):
             return
         books, _ = self.bot._books(hedge_ex)
-        r = quoting.reprice(spec, books, quotes, self.cfg.quote_edge, self.cfg.quote_size)
+        r = quoting.reprice(spec, books, quotes, self.cfg.quote_edge, self.cfg.quote_size, self.cfg.depth_fraction)
         if r is None:
             return
         spec, size = r

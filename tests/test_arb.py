@@ -342,3 +342,12 @@ def test_bot_wakes_for_pushed_fills_before_the_next_cycle(monkeypatch, tmp_path)
     bot._wait_until(t0 + 0.5)
     assert handled and handled[0] - t0 < 0.3  # handled at the push, then waited out the cycle
     assert time.monotonic() - t0 >= 0.5
+
+
+def test_depth_fraction_leaves_a_cushion_on_every_level():
+    b = arb.build_baskets([market("1", "Democratic"), market("2", "Republican")])[0]
+    books = {"e1": book("e1", bids=[(.63, 100), (.62, 500)]), "e2": book("e2", bids=[(.39, 300), (.37, 1000)])}
+    full = arb.size(b, "no", books, .005, 10_000)
+    half = arb.size(b, "no", books, .005, 10_000, depth_fraction=.5)
+    assert full.sets == 300 and half.sets == 150  # 50 @ +.02 then 100 @ +.01, never the whole level
+    assert half.limits == full.limits

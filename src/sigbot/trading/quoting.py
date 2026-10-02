@@ -69,7 +69,7 @@ def select_quotes(baskets: Iterable[Basket], quotes: Quotes, n: int, edge: float
 
 
 def reprice(spec: QuoteSpec, hedge_books: Dict[str, OrderBook], quotes: Quotes, edge: float,
-            max_size: int) -> Optional[Tuple[QuoteSpec, int]]:
+            max_size: int, depth_fraction: float = 1.0) -> Optional[Tuple[QuoteSpec, int]]:
     """Price from the hedge legs' fresh books and size by their top-of-book depth, so a fill can
     be hedged at the priced level. None if no longer viable."""
     fresh: Quotes = dict(quotes)
@@ -80,7 +80,7 @@ def reprice(spec: QuoteSpec, hedge_books: Dict[str, OrderBook], quotes: Quotes, 
             return None
         bid, ask = fresh.get(ex, (None, None))
         fresh[ex] = (round(1 - no_asks[0].price, 6), ask)
-        depth.append(no_asks[0].quantity)
+        depth.append(no_asks[0].quantity * depth_fraction)
     s = quote_price(spec.basket, spec.leg, fresh, edge)
     if s is None:
         return None

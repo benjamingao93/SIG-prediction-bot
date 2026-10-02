@@ -111,10 +111,15 @@ def _levels(book: OrderBook, side: str) -> List[Level]:
 
 
 def _walk(ladders: List[List[Level]], profit: Callable[[List[float]], float], min_profit: float,
-          max_sets: int) -> Optional[Tuple[int, Tuple[float, ...], float]]:
+          max_sets: int, depth_fraction: float = 1.0) -> Optional[Tuple[int, Tuple[float, ...], float]]:
     """Walk every leg's ladder together (best level first), adding sets while the marginal set
     still clears min_profit. profit(prices) is the gain of one set at those per-leg prices.
+    Only depth_fraction of each level's shown quantity is used: if someone else takes part of a
+    level first, every leg can still fill (a leg that comes up short needs a repair).
     Returns (sets, worst price taken per leg, Σ over sets of Σ prices), or None."""
+    if depth_fraction < 1.0:
+        ladders = [[Level(l.price, int(l.quantity * depth_fraction)) for l in lad] for lad in ladders]
+        ladders = [[l for l in lad if l.quantity >= 1] for lad in ladders]
     if not ladders or any(not lad for lad in ladders):
         return None
     idx = [0] * len(ladders)
@@ -142,11 +147,11 @@ def _walk(ladders: List[List[Level]], profit: Callable[[List[float]], float], mi
 
 
 def size(basket: Basket, side: str, books: Dict[str, OrderBook], min_profit: float,
-         max_sets: int) -> Optional[ArbOrder]:
+         max_sets: int, depth_fraction: float = 1.0) -> Optional[ArbOrder]:
     """Buy sets while each one still clears min_profit."""
     payout = basket.payout(side)
     r = _walk([_levels(books[l.exchange_id], side) for l in basket.legs],
-              lambda prices: payout - sum(prices), min_profit, max_sets)
+              lambda prices: payout - sum(prices), min_profit, max_sets, depth_fraction)
     return ArbOrder(basket, side, r[0], r[1], r[2]) if r else None
 
 
@@ -210,12 +215,13 @@ def screen_exit(basket: Basket, quotes: Dict[str, Tuple[Optional[float], Optiona
 
 
 def size_exit(basket: Basket, books: Dict[str, OrderBook], held_sets: int, bar: float,
-              max_sets: int, cost_per_set: Optional[float] = None) -> Optional[ExitOrder]:
+              max_sets: int, cost_per_set: Optional[float] = None,
+              depth_fraction: float = 1.0) -> Optional[ExitOrder]:
     """Sell NO by walking each leg's YES asks (selling NO at p ≡ buying YES at 1 − p) while each
     set's proceeds still reach the bar."""
     ladders = [[Level(round(1 - a.price, 6), a.quantity) for a in books[l.exchange_id].asks]
                for l in basket.legs]
-    r = _walk(ladders, lambda prices: sum(prices) - bar, -2e-9, min(held_sets, max_sets))
+    r = _walk(ladders, lambda prices: sum(prices) - bar, -2e-9, min(held_sets, max_sets), depth_fraction)
     return ExitOrder(basket, r[0], r[1], r[2], cost_per_set) if r else None
 
 

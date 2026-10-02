@@ -125,10 +125,20 @@ def unhedged(positions: List[Dict[str, Any]], race_legs: Dict[str, List[str]],
 
 def local_state(db: DB, s: Settings) -> Dict[str, Any]:
     status = db.get_status()
+    alive = db.get_alive()
+    now = datetime.now(timezone.utc)
     if status:
-        age = (datetime.now(timezone.utc) - datetime.fromisoformat(status["ts"])).total_seconds()
+        age = (now - datetime.fromisoformat(status["ts"])).total_seconds()
         status["age"] = round(age)
         status["running"] = age < max(20.0, 4 * status.get("poll_seconds", 4))
+        if alive:
+            # The alive signal comes from its own thread every 10 s: trust it over the
+            # per-cycle heartbeat, which a slow exchange can hold up for minutes.
+            alive_age = (now - datetime.fromisoformat(alive["ts"])).total_seconds()
+            status["alive_age"] = round(alive_age)
+            status["running"] = alive_age < 30
+            started = alive.get("cycle_started")
+            status["cycle_running"] = round(now.timestamp() - started) if started else None
     orders: Dict[tuple, Dict[str, Any]] = {}
     for r in db.query("SELECT * FROM signals ORDER BY ts DESC LIMIT 400"):
         try:

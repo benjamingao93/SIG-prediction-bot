@@ -162,11 +162,14 @@ function render(d) {
   if (!S) { pill.className = "pill down"; pill.textContent = "Never run"; }
   else if (!S.running) { pill.className = "pill down"; pill.textContent = "Stopped"; }
   else { pill.className = `pill ${S.mode}`; pill.textContent = S.mode === "live" ? "Live" : "Paper"; }
-  $("updated").textContent = S ? `bot heartbeat ${dur(S.age)} ago` : "";
+  const slow = S?.running && S.cycle_running != null && S.cycle_running > 30;
+  $("updated").textContent = !S ? "" : slow ? `cycle running ${dur(S.cycle_running)} (exchange slow)` :
+    `last cycle ${dur(S.age)} ago`;
 
   // alerts
   const alerts = [];
-  if (S && !S.running) alerts.push(["bad", `Bot is not running: last heartbeat ${dur(S.age)} ago. Start it with sigbot arb --live.`]);
+  if (S && !S.running) alerts.push(["bad", `Bot is not running: no sign of life for ${dur(S.alive_age ?? S.age)}. Start it with sigbot arb --live.`]);
+  if (slow) alerts.push(["warn", `The bot is alive but its current cycle has run ${dur(S.cycle_running)}: the exchange is answering slowly.`]);
   if (!S) alerts.push(["warn", "No heartbeat yet. Restart the bot (sigbot arb --live) so it runs the version that reports to this dashboard."]);
   if (L.kill_switch) alerts.push(["bad", "Kill switch file is present: the bot will not send new orders."]);
   const R = L.repairs || {};

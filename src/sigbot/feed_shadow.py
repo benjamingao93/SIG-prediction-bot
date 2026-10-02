@@ -63,7 +63,7 @@ class Shadow:
             age = max((store.age(l.exchange_id, now) or 0.0) for l in b.legs)
             side = arb.screen(b, quotes, self.cfg.min_profit, self.cfg.allow_yes)
             if side:
-                o = arb.size(b, side, books, self.cfg.min_profit, self.cfg.max_sets)
+                o = arb.size(b, side, books, self.cfg.min_profit, self.cfg.max_sets, self.cfg.depth_fraction)
                 if o and self._fresh_log(("buy", b.key, o.sets)):
                     self.stats["would_buy"] += 1
                     log.info("WOULD BUY  %s %s×%d sets=%d profit=%+.2f books %.1fs old",
@@ -73,7 +73,7 @@ class Shadow:
                 bar = arb.exit_bar(b, cost, self.cfg.min_profit,
                                    self.cfg.exit_min_profit if self.cfg.exit_early else None)
                 if arb.screen_exit(b, quotes, bar) is not None:
-                    o = arb.size_exit(b, books, self.held[b.key], bar, self.cfg.max_sets, cost)
+                    o = arb.size_exit(b, books, self.held[b.key], bar, self.cfg.max_sets, cost, self.cfg.depth_fraction)
                     if o and self._fresh_log(("exit", b.key, o.sets)):
                         self.stats["would_exit"] += 1
                         log.info("WOULD EXIT %s sets=%d profit=%+.2f (vs holding %+.2f) books %.1fs old",

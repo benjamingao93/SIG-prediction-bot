@@ -43,7 +43,7 @@ positions from the exchange.
 
 Exits (`ARB_EXIT`, on by default): a NO basket you hold pays `k−1` per set at settlement, and
 selling it pays `Σ(1 − ask)` now. The bot sells as soon as that locks in `ARB_EXIT_MIN_PROFIT`
-(0.005) per set over what the set cost, taking a smaller profit now and freeing the capital
+(0.0025) per set over what the set cost, taking a smaller profit now and freeing the capital
 (`ARB_EXIT_EARLY=false` turns this off). It also sells whenever selling beats holding to settlement
 by `ARB_MIN_PROFIT`, which is riskless extra profit.
 Holdings come from the exchange's positions, and only races held evenly on every leg count, so

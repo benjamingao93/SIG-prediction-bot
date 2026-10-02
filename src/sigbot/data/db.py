@@ -43,6 +43,9 @@ CREATE TABLE IF NOT EXISTS arb_quotes (
 CREATE TABLE IF NOT EXISTS arb_repairs (
     race TEXT PRIMARY KEY, data TEXT, created TEXT, updated TEXT
 );
+CREATE TABLE IF NOT EXISTS bot_alive (
+    id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, cycle_started REAL, cycle INTEGER, mode TEXT
+);
 CREATE TABLE IF NOT EXISTS bot_status (
     id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, status TEXT
 );
@@ -162,6 +165,17 @@ class DB:
     def delete_quote(self, race: str) -> None:
         self.conn.execute("DELETE FROM arb_quotes WHERE race=?", (race,))
         self.conn.commit()
+
+    def set_alive(self, cycle_started: Optional[float], cycle: int, mode: str) -> None:
+        """Written every few seconds from a separate thread, so the dashboard can tell a bot stuck
+        in a slow cycle from a stopped one."""
+        self.conn.execute("INSERT OR REPLACE INTO bot_alive VALUES (1, ?, ?, ?, ?)",
+                          (now_iso(), cycle_started, cycle, mode))
+        self.conn.commit()
+
+    def get_alive(self) -> Optional[Dict[str, Any]]:
+        r = self.conn.execute("SELECT * FROM bot_alive WHERE id = 1").fetchone()
+        return dict(r) if r else None
 
     def get_status(self) -> Optional[Dict[str, Any]]:
         r = self.conn.execute("SELECT ts, status FROM bot_status WHERE id = 1").fetchone()
