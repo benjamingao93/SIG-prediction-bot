@@ -14,6 +14,8 @@
   sigbot arb --quote           also rest passive quotes (paper: simulated fills; add --live for real)
   sigbot arb --feed            realtime books for the races that matter, so trades don't wait on reads
   sigbot arb --exit-only       only sell baskets (and finish repairs): frees capital, buys nothing
+  sigbot arb --directional     also bet against SIG's mispricings vs Kalshi + ratings (short holds)
+  sigbot arb --live --directional-paper   live arbitrage, directional trader simulated alongside
   sigbot hedge RACE --max-price P   have the arb bot finish hedging an uneven race (NO side)
   sigbot dashboard             local dashboard at http://localhost:8050 (read-only)
   sigbot run                   model strategy, paper trading (logs signals, sends nothing)
@@ -180,6 +182,8 @@ def cmd_arb(s: Settings, a) -> None:
         s = replace(s, arb=replace(s.arb, feed=True))
     if a.exit_only:
         s = replace(s, arb=replace(s.arb, exit_only=True))
+    if a.directional or a.directional_paper:
+        s = replace(s, dir=replace(s.dir, directional=True, paper=a.directional_paper))
     if s.arb.exit_only and not s.arb.exit_enabled:
         raise SystemExit("--exit-only with ARB_EXIT=false would do nothing but repairs. Turn exits on.")
     if live and s.mode != "live":
@@ -300,6 +304,10 @@ def main(argv=None) -> None:
     ar.add_argument("--quote", action="store_true", help="rest passive quotes (paper unless --live)")
     ar.add_argument("--feed", action="store_true", help="realtime books for watched races (needs .[realtime])")
     ar.add_argument("--exit-only", action="store_true", help="sell held baskets and finish repairs; buy nothing new")
+    ar.add_argument("--directional", action="store_true",
+                    help="bet where SIG disagrees with Kalshi + ratings (paper unless --live; live budget DIR_LIVE_BUDGET)")
+    ar.add_argument("--directional-paper", action="store_true",
+                    help="run the directional trader in paper mode, even inside a --live bot")
     ar.add_argument("--cycles", type=int); ar.set_defaults(fn=cmd_arb)
     h = sub.add_parser("hedge"); h.add_argument("race"); h.add_argument("--max-price", type=float)
     h.add_argument("--cancel", action="store_true"); h.set_defaults(fn=cmd_hedge)

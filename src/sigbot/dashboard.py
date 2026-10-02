@@ -59,6 +59,12 @@ class ExchangeCache:
                 return {"loading": True}
             return {**self.data, "age": round(time.time() - self.fetched)}
 
+    def _ledger(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for p in DB(self.s.db_path).dir_positions("live").values():
+            out[p["exchange_id"]] = out.get(p["exchange_id"], 0.0) + p["qty"]
+        return out
+
     def _refresh(self) -> None:
         slug = self.s.tournament_slug
         data = dict(self.data)
@@ -77,7 +83,7 @@ class ExchangeCache:
             fills = self.client.get(f"/tournaments/{slug}/portfolio/fills", limit=100).get("data", [])
             data = {
                 "ok": True,
-                "unhedged": unhedged(pos, self.race_legs, self.titles),
+                "unhedged": unhedged(pos, self.race_legs, self.titles, self._ledger()),
                 "tournament": {"name": t.get("name"), "end": t.get("endDate"), "currency": t.get("currencyName")},
                 "cash": t.get("myBalance"),
                 "account_value": pnl.get("totalAccountValue"),
@@ -104,14 +110,17 @@ class ExchangeCache:
 
 
 def unhedged(positions: List[Dict[str, Any]], race_legs: Dict[str, List[str]],
-             titles: Dict[str, str]) -> List[Dict[str, Any]]:
+             titles: Dict[str, str], ledger: Optional[Dict[str, float]] = None) -> List[Dict[str, Any]]:
     """Races where NO holdings differ across the party markets: not a complete basket, so the
-    payout depends on who wins. Any shortfall is a leg the bot (or you) still needs to buy."""
+    payout depends on who wins. Any shortfall is a leg the bot (or you) still needs to buy.
+    `ledger`: NO shares the directional trader holds on purpose, left out of the comparison."""
+    ledger = ledger or {}
     no_qty: Dict[str, float] = {}
     for p in positions:
         side = ((p.get("lots") or [{}])[0].get("side") or "").lower()
         if side == "no" and not p.get("settled"):
-            no_qty[str(p.get("exchangeId"))] = abs(float(p.get("quantity") or 0))
+            ex = str(p.get("exchangeId"))
+            no_qty[ex] = max(0.0, abs(float(p.get("quantity") or 0)) - ledger.get(ex, 0.0))
     out = []
     for race, legs in race_legs.items():
         held = {ex: no_qty.get(ex, 0.0) for ex in legs}

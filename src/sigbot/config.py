@@ -73,6 +73,18 @@ class DirectionalConfig:
     kalshi_refresh: float = 300.0  # seconds between Kalshi refreshes (its own API, not SIG's budget)
     kalshi_max_age: float = 900.0  # ignore Kalshi quotes older than this
     history_every: float = 600.0  # seconds between edge-history rows
+    # Phase 1 trader (`sigbot arb --directional`): short holds against the fair value.
+    directional: bool = False
+    paper: bool = False  # keep the directional trader in paper mode even inside a live bot
+    live_budget: float = 5_000.0  # in live mode, the budget and race cap start smaller
+    live_max_race: float = 500.0
+    kelly_fraction: float = 0.25
+    max_net: float = 8_000.0  # |cost on "D wins" views − cost on "R wins" views|: one national bet
+    loss_stop: float = 2_000.0  # realized + unrealized (at SIG's bid) losses that halt new entries
+    take_half_at: float = 0.5  # sell half once SIG's price has closed this share of the gap
+    exit_band: float = 0.005  # sell the rest once SIG's sell price is within this of fair value
+    stop: float = 0.03  # cut a position once the fair value falls this far below its entry price
+    writes_per_cycle: int = 2
 
 
 @dataclass(frozen=True)
@@ -158,6 +170,14 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         kalshi_refresh=_f("DIR_KALSHI_REFRESH", dd.kalshi_refresh),
         kalshi_max_age=_f("DIR_KALSHI_MAX_AGE", dd.kalshi_max_age),
         history_every=_f("DIR_HISTORY_EVERY", dd.history_every),
+        live_budget=_f("DIR_LIVE_BUDGET", dd.live_budget),
+        live_max_race=_f("DIR_LIVE_MAX_RACE", dd.live_max_race),
+        kelly_fraction=_f("DIR_KELLY_FRACTION", dd.kelly_fraction),
+        max_net=_f("DIR_MAX_NET", dd.max_net),
+        loss_stop=_f("DIR_LOSS_STOP", dd.loss_stop),
+        take_half_at=_f("DIR_TAKE_HALF_AT", dd.take_half_at),
+        exit_band=_f("DIR_EXIT_BAND", dd.exit_band),
+        stop=_f("DIR_STOP", dd.stop),
     )
     return Settings(
         api_key=api_key,

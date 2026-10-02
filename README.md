@@ -148,6 +148,33 @@ bot already polls, and every 10 minutes they are written to an edge history and 
 halved and closed, and whether SIG's price or the fair value did the moving. `DIR_TRACK=false` turns
 it off.
 
+## Directional trader: `sigbot arb --directional` (Phase 1)
+
+Bets where SIG's price disagrees with the fair value, and sells when SIG catches up: short holds,
+so capital turns over instead of waiting for November.
+
+- **Entries**: views that clear the bar with Kalshi and the ratings agreeing (Kalshi-backed only),
+  best return on capital (edge ÷ price) first, one position per race, bought as NO on the other
+  party. Size = the smallest of the book's depth while each level still clears the bar (with the
+  `ARB_DEPTH_FRACTION` cushion), ¼-Kelly (`DIR_KELLY_FRACTION`) on the budget, `DIR_MAX_RACE`, the
+  budget left, and `DIR_MAX_NET` (Democratic-direction minus Republican-direction cost: one national
+  bet). Nothing new once realized + unrealized losses reach `DIR_LOSS_STOP`.
+- **Exits**: sell half once SIG's sell price has closed `DIR_TAKE_HALF_AT` (half) of the gap to fair
+  value, the rest within `DIR_EXIT_BAND` (0.005) of fair, both only at a profit; cut the position if
+  the fair value falls `DIR_STOP` (0.03) below its entry price. With stale Kalshi data it does nothing.
+- **Kept apart from the baskets**: positions live in their own ledger, so basket detection, exits,
+  repairs and the dashboard's Unhedged panel ignore them.
+- **Budgets**: paper uses `DIR_BUDGET` / `DIR_MAX_RACE` (20,000 / 2,000); live starts at
+  `DIR_LIVE_BUDGET` / `DIR_LIVE_MAX_RACE` (5,000 / 500).
+
+```bash
+sigbot arb --live --directional-paper   # live arbitrage; directional trader simulated alongside
+sigbot arb --live --directional         # real directional orders (5,000 / 500 to start)
+```
+
+The dashboard's **Directional book** panel shows positions, entry vs. sell price vs. fair value,
+budget used, net direction and P&L; `sigbot convergence` shows how fast gaps have been closing.
+
 ## Fundamentals model: `data/races.csv`
 
 `sigbot races` pulls every 2026 House, Senate and Governor race from Wikipedia: Cook PVI, the

@@ -47,6 +47,14 @@ CREATE TABLE IF NOT EXISTS edges_history (
     agree INTEGER, sig_p_d REAL, kalshi_p_d REAL, rating_p_d REAL
 );
 CREATE INDEX IF NOT EXISTS ix_edges_history ON edges_history(race, view, ts);
+CREATE TABLE IF NOT EXISTS dir_positions (
+    mode TEXT, race TEXT, view TEXT, exchange_id TEXT, market_id TEXT, title TEXT,
+    qty REAL, cost REAL, entry_price REAL, fair_entry REAL, halved INTEGER DEFAULT 0,
+    realized REAL DEFAULT 0, opened TEXT, updated TEXT, PRIMARY KEY (mode, race)
+);
+CREATE TABLE IF NOT EXISTS dir_realized (
+    mode TEXT PRIMARY KEY, realized REAL
+);
 CREATE TABLE IF NOT EXISTS edges_snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, data TEXT
 );
@@ -196,6 +204,33 @@ class DB:
             [(ts, r["race"], r["view"], r["price"], r["fair"], r["edge"], r["required"], int(bool(r["agree"])),
               r.get("sig_p_d"), r.get("kalshi_p_d"), r.get("rating_p_d")) for r in rows])
         self.conn.commit()
+
+    # ---- directional ledger: positions the directional trader holds, kept apart from baskets ----
+
+    def dir_positions(self, mode: str) -> Dict[str, Dict[str, Any]]:
+        return {r["race"]: dict(r) for r in self.conn.execute("SELECT * FROM dir_positions WHERE mode = ?", (mode,))}
+
+    def save_dir_position(self, p: Dict[str, Any]) -> None:
+        cols = ["mode", "race", "view", "exchange_id", "market_id", "title", "qty", "cost", "entry_price",
+                "fair_entry", "halved", "realized", "opened", "updated"]
+        p = {**p, "updated": now_iso(), "opened": p.get("opened") or now_iso()}
+        self.conn.execute(f"INSERT OR REPLACE INTO dir_positions ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                          [p.get(c) for c in cols])
+        self.conn.commit()
+
+    def close_dir_position(self, mode: str, race: str) -> None:
+        self.conn.execute("DELETE FROM dir_positions WHERE mode = ? AND race = ?", (mode, race))
+        self.conn.commit()
+
+    def add_dir_realized(self, mode: str, amount: float) -> float:
+        cur = self.dir_realized(mode) + amount
+        self.conn.execute("INSERT OR REPLACE INTO dir_realized VALUES (?, ?)", (mode, cur))
+        self.conn.commit()
+        return cur
+
+    def dir_realized(self, mode: str) -> float:
+        r = self.conn.execute("SELECT realized FROM dir_realized WHERE mode = ?", (mode,)).fetchone()
+        return float(r["realized"]) if r else 0.0
 
     def set_edges(self, data: Any) -> None:
         self.conn.execute("INSERT OR REPLACE INTO edges_snapshot VALUES (1, ?, ?)", (now_iso(), json.dumps(data)))

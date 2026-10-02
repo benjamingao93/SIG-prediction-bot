@@ -92,8 +92,14 @@ class ArbBot:
         self._history_at = -1e9
         self._edges: List[Any] = []
         from .fairvalue_service import FairValueService
-        if s.dir.track and FairValueService.available(s):
+        if (s.dir.track or s.dir.directional) and FairValueService.available(s):
             self.fair = FairValueService(s)
+        self.director = None
+        if s.dir.directional:
+            if self.fair is None:
+                raise SystemExit("--directional needs fair values: run `sigbot races` and `sigbot kalshi` first.")
+            from .directional import Director
+            self.director = Director(self)
 
     # ---- setup ----
 
@@ -115,11 +121,19 @@ class ArbBot:
             return
         if not self._can_read(1):
             return
+        # Directional positions sit on the same markets: take their shares and cost out first, so
+        # baskets (and their exit prices) are what the arb bot actually bought.
+        led_q = self.director.ledger_qty() if self.director and self.director.live else {}
+        led_c = self.director.ledger_cost() if self.director and self.director.live else {}
         no_held, avg = {}, {}
         for p in pf.positions(self.client, self.s.tournament_slug):
             if p.side == "no" and not p.settled:
-                no_held[p.exchange_id] = abs(p.quantity)
-                avg[p.exchange_id] = p.avg_cost
+                q = abs(p.quantity) - led_q.get(p.exchange_id, 0.0)
+                if q < 1:
+                    continue
+                no_held[p.exchange_id] = q
+                avg[p.exchange_id] = (abs(p.cost_basis) - led_c.get(p.exchange_id, 0.0)) / q \
+                    if p.exchange_id in led_q else p.avg_cost
         self.held = arb.held_baskets(self.baskets, no_held)
         self.held_cost = {b.key: sum(avg.get(l.exchange_id, 0.0) for l in b.legs)
                           for b in self.baskets if b.key in self.held}
@@ -220,6 +234,8 @@ class ArbBot:
         traded = 0
         if self.cfg.exit_enabled:
             traded += self._exits(quotes)
+        if self.director is not None:
+            self.director.step()  # its exits always run; its entries respect --exit-only itself
         if self.cfg.exit_only:
             return traded  # exits and repairs only: no new baskets, no quotes
         if self.quoter:
@@ -494,6 +510,7 @@ class ArbBot:
             "frozen": sorted(self.repairs), "stale_skips": self.stale_skips, "last_error": self.last_error,
             "exits": self.exits, "exit_enabled": self.cfg.exit_enabled, "exit_only": self.cfg.exit_only,
             "quoting": self.quoter.status(self._quotes) if self.quoter else None,
+            "directional": self.director.status() if self.director else None,
             "feed": None if self.feed is None else {
                 "healthy": self.feed.healthy, "watching": len(self.feed.market_ids),
                 "subscribed": len(self.feed.subscribed), "hits": self.feed_hits, "misses": self.feed_misses,

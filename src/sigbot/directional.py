@@ -1,0 +1,233 @@
+"""Phase 1 directional trader (`sigbot arb --directional`): short holds against the fair value.
+
+Each cycle, using the edges the FairValueService computed from this cycle's SIG prices:
+
+Exits first (they free capital):
+  - sell half once SIG's sell price (the NO bid, 1 − YES ask) has closed DIR_TAKE_HALF_AT of the gap
+    between the entry price and today's fair value, at a profit;
+  - sell the rest once that price is within DIR_EXIT_BAND of fair value, at a profit;
+  - cut the position if the fair value falls DIR_STOP below the entry price (the view broke).
+  With no fresh fair value (Kalshi stale), positions are left alone.
+Entries, best return on capital (edge ÷ price) first:
+  - only views that clear the bar (and, with DIR_REQUIRE_AGREEMENT, where every source agrees),
+    one position per race;
+  - bought as NO on the other party's market, so it never cancels against basket holdings;
+  - sized by the smallest of: the book's depth while each level still clears the bar (with the
+    ARB_DEPTH_FRACTION cushion), ¼-Kelly on the budget, the per-race cap, the budget left, and the
+    net-direction cap; nothing new once losses reach DIR_LOSS_STOP.
+Positions live in their own ledger (dir_positions), so the arb bot's basket detection, exits and
+repairs never mistake them for uneven baskets. Paper mode simulates fills at the book's prices.
+"""
+from __future__ import annotations
+
+import logging
+import math
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from .api import orders
+from .api.client import SigAPIError
+from .models.fairvalue import Edge
+from .trading import arb
+from .trading.sizing import kelly_shares
+
+if TYPE_CHECKING:
+    from .arb_bot import ArbBot
+
+log = logging.getLogger(__name__)
+
+
+class Director:
+    def __init__(self, bot: "ArbBot"):
+        self.bot = bot
+        self.cfg = bot.s.dir
+        self.live = bot.live and not self.cfg.paper  # --directional-paper: simulate inside a live bot
+        self.mode = "live" if self.live else "paper"
+        self.budget = self.cfg.live_budget if self.live else self.cfg.budget
+        self.max_race = self.cfg.live_max_race if self.live else self.cfg.max_race
+        self._writes = 0
+        self.stats: Dict[str, float] = {"entries": 0, "exits": 0}
+
+    # ---- state ----
+
+    def positions(self) -> Dict[str, Dict[str, Any]]:
+        return self.bot.db.dir_positions(self.mode)
+
+    def sell_price(self, exchange_id: str) -> Optional[float]:
+        """What selling NO pays right now: 1 − the market's YES ask."""
+        ask = self.bot._quotes.get(exchange_id, (None, None))[1]
+        return None if ask is None else round(1 - ask, 6)
+
+    def _fair(self, race: str, view: str) -> Optional[float]:
+        for e in self.bot._edges:
+            if e.race == race and e.view == view and "kalshi" in e.fv.sources:
+                return e.fair  # only trust Kalshi-backed fair values for exits too
+        return None
+
+    def unrealized(self, positions: Dict[str, Dict[str, Any]]) -> float:
+        total = 0.0
+        for p in positions.values():
+            px = self.sell_price(p["exchange_id"])
+            if px is not None:
+                total += (px - p["entry_price"]) * p["qty"]
+        return total
+
+    def net_direction(self, positions: Dict[str, Dict[str, Any]]) -> float:
+        return sum(p["cost"] if p["view"] == "D" else -p["cost"] for p in positions.values())
+
+    # ---- one cycle ----
+
+    def step(self) -> None:
+        self._writes = 0
+        if self.bot.s.kill_switch.exists():
+            return
+        fresh = self.bot.fair is not None and self.bot.fair.fresh()
+        held = self.positions()
+        if fresh:
+            for race, p in list(held.items()):
+                if self._writes >= self.cfg.writes_per_cycle:
+                    break
+                self._manage(p)
+        if not fresh or self.bot.cfg.exit_only:
+            return
+        held = self.positions()
+        if self.bot.db.dir_realized(self.mode) + self.unrealized(held) <= -self.cfg.loss_stop:
+            log.warning("directional: loss stop reached, no new entries")
+            return
+        cands = [e for e in self.bot._edges if e.tradeable and (e.agree or not self.cfg.require_agreement)
+                 and "kalshi" in e.fv.sources and e.race not in held and e.race not in self.bot.repairs]
+        for e in sorted(cands, key=lambda e: -(e.edge / e.price)):
+            if self._writes >= self.cfg.writes_per_cycle or not self.bot._can_read(1):
+                break
+            self._enter(e, held)
+            held = self.positions()
+
+    # ---- exits ----
+
+    def _manage(self, p: Dict[str, Any]) -> None:
+        fair = self._fair(p["race"], p["view"])
+        px = self.sell_price(p["exchange_id"])
+        if fair is None or px is None:
+            return
+        entry = p["entry_price"]
+        if fair < entry - self.cfg.stop:
+            self._sell(p, p["qty"], px, f"stop: fair {fair:.3f} fell below entry {entry:.3f}")
+        elif px > entry and px >= fair - self.cfg.exit_band:
+            self._sell(p, p["qty"], px, f"take profit: {px:.3f} reached fair {fair:.3f}")
+        elif (not p["halved"] and px > entry and fair > entry
+              and px >= entry + self.cfg.take_half_at * (fair - entry) and p["qty"] >= 2):
+            self._sell(p, math.floor(p["qty"] / 2), px, f"take half: {px:.3f} closed half the gap to {fair:.3f}",
+                       halved=True)
+
+    def _sell(self, p: Dict[str, Any], qty: float, px: float, why: str, halved: bool = False) -> None:
+        qty = int(qty)
+        if qty < 1:
+            return
+        if self.live:
+            self._writes += 1
+            try:
+                r = orders.place_limit(self.bot.client, p["exchange_id"], "no", "sell", qty, px, self.bot.tid,
+                                       ttl_seconds=self.bot.cfg.order_ttl)
+            except SigAPIError as e:
+                log.error("directional sell %s rejected: %s", p["race"], e)
+                return
+            got = self.bot._settle_leg(r)
+            proceeds = abs(float(r.get("totalCost") or 0)) or got * px
+        else:
+            got, proceeds = qty, qty * px
+        if got < 1:
+            return
+        cost_out = p["entry_price"] * got
+        realized = proceeds - cost_out
+        p = {**p, "qty": p["qty"] - got, "cost": p["cost"] - cost_out, "realized": p["realized"] + realized,
+             "halved": 1 if halved or p["halved"] else 0}
+        self.bot.db.add_dir_realized(self.mode, realized)
+        if p["qty"] < 1:
+            self.bot.db.close_dir_position(self.mode, p["race"])
+        else:
+            self.bot.db.save_dir_position(p)
+        self.stats["exits"] += 1
+        self._log(p, "sell", got, px, realized / got)
+        log.info("%s DIRECTIONAL SELL %s %s: %d NO at %.3f, %+.2f (%s)", self.mode.upper(), p["race"], p["view"],
+                 got, px, realized, why)
+
+    # ---- entries ----
+
+    def _enter(self, e: Edge, held: Dict[str, Dict[str, Any]]) -> None:
+        books, read_at = self.bot._books([e.buy_exchange])
+        ladder = books[e.buy_exchange].no_asks()
+        walk = arb._walk([ladder], lambda prices: e.fair - prices[0], e.required, 10 ** 9,
+                         self.bot.cfg.depth_fraction)
+        if not walk:
+            return
+        depth_qty, (limit,), total = walk
+        used = sum(p["cost"] for p in held.values())
+        room = min(self.max_race, self.budget - used)
+        net = self.net_direction(held)
+        sign = 1 if e.view == "D" else -1
+        room = min(room, max(0.0, self.cfg.max_net - sign * net))  # how far this side may still go
+        qty = min(depth_qty, kelly_shares(e.fair, total / depth_qty, self.budget, self.cfg.kelly_fraction),
+                  int(room // limit) if limit > 0 else 0)
+        if qty < 1 or self.bot._stale(read_at, f"directional {e.race}"):
+            return
+        # Re-walk for exactly qty shares: the cost and the worst level we actually need.
+        _, (limit,), cost = arb._walk([ladder], lambda prices: e.fair - prices[0], e.required, qty,
+                                      self.bot.cfg.depth_fraction)
+        if self.live:
+            self._writes += 1
+            try:
+                r = orders.place_limit(self.bot.client, e.buy_exchange, "no", "buy", qty, limit, self.bot.tid,
+                                       ttl_seconds=self.bot.cfg.order_ttl)
+            except SigAPIError as err:
+                log.error("directional buy %s rejected: %s", e.race, err)
+                return
+            got = self.bot._settle_leg(r)
+            cost = abs(float(r.get("totalCost") or 0)) or got * limit
+        else:
+            got = qty
+        if got < 1:
+            return
+        market = next((l for b in self.bot.baskets if b.key == e.race for l in b.legs
+                       if l.exchange_id == e.buy_exchange), None)
+        p = {"mode": self.mode, "race": e.race, "view": e.view, "exchange_id": e.buy_exchange,
+             "market_id": market.market_id if market else None, "title": market.title if market else "",
+             "qty": got, "cost": cost, "entry_price": cost / got, "fair_entry": e.fair, "halved": 0, "realized": 0.0}
+        self.bot.db.save_dir_position(p)
+        self.bot.cash -= cost if self.live else 0
+        self.stats["entries"] += 1
+        self._log(p, "buy", got, cost / got, e.fair - cost / got)
+        log.info("%s DIRECTIONAL BUY %s (%s wins): %d NO at %.3f avg, fair %.3f, edge %+.3f/share",
+                 self.mode.upper(), e.race, e.view, got, cost / got, e.fair, e.fair - cost / got)
+
+    # ---- logging & dashboard ----
+
+    def _log(self, p: Dict[str, Any], action: str, qty: float, price: float, edge: float) -> None:
+        self.bot.db.log_signal(mode=self.mode, market_id=p.get("market_id"), exchange_id=p["exchange_id"],
+                               side="no", action=action, price=price, quantity=int(qty), edge=edge,
+                               status=f"dir-{action}", response={"basket": p["race"], "directional": True})
+
+    def status(self) -> Dict[str, Any]:
+        held = self.positions()
+        rows = []
+        for p in held.values():
+            px = self.sell_price(p["exchange_id"])
+            rows.append({"race": p["race"], "view": p["view"], "qty": p["qty"], "entry": p["entry_price"],
+                         "price": px, "fair": self._fair(p["race"], p["view"]), "halved": bool(p["halved"]),
+                         "unrealized": None if px is None else (px - p["entry_price"]) * p["qty"], "opened": p["opened"]})
+        return {"mode": self.mode, "budget": self.budget, "max_race": self.max_race,
+                "used": sum(p["cost"] for p in held.values()), "net": self.net_direction(held),
+                "realized": self.bot.db.dir_realized(self.mode), "unrealized": self.unrealized(held),
+                "positions": rows, **self.stats}
+
+    def ledger_qty(self) -> Dict[str, float]:
+        """exchange → NO shares the directional trader holds (live), for basket detection."""
+        out: Dict[str, float] = {}
+        for p in self.bot.db.dir_positions("live").values():
+            out[p["exchange_id"]] = out.get(p["exchange_id"], 0.0) + p["qty"]
+        return out
+
+    def ledger_cost(self) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for p in self.bot.db.dir_positions("live").values():
+            out[p["exchange_id"]] = out.get(p["exchange_id"], 0.0) + p["cost"]
+        return out
