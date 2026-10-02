@@ -180,3 +180,14 @@ def test_call_patiently_retries_slow_exchange_but_not_bad_requests():
         raise SigAPIError(400, "VALIDATION_ERROR", "nope")
     with pytest.raises(SigAPIError):
         call_patiently(client, bad, "x", sleep=slept.append)
+
+
+def test_standalone_book_dirty_marks_the_book_untrusted_until_reloaded():
+    r = runner()
+    r.store.apply("m", raw(1, 5))
+    r.healthy, r.subscribed, r.joined = True, {"m"}, {"m": object()}
+    assert r.usable("1")
+    r._on_dirty("m", "book_dirty")  # sent outside a market_batch, with no book
+    assert not r.usable("1") and "m" in r.feed.need_resync
+    r._on_dirty("gone", "book_dirty")  # a market we've left: ignored
+    assert "gone" not in r.feed.need_resync

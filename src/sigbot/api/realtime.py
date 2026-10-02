@@ -279,6 +279,11 @@ class FeedRunner:
         except Exception:
             log.exception("bad batch on market %s", market_id)
 
+    def _on_dirty(self, market_id: str, event: str) -> None:
+        if market_id in self.joined:
+            self.feed.need_resync.add(market_id)
+            self.feed.stats[event] += 1
+
     def _on_state(self, market_id: str, state: Any, err: Any = None) -> None:
         name = str(state).rsplit(".", 1)[-1]
         if name == "SUBSCRIBED":
@@ -331,6 +336,10 @@ class FeedRunner:
             for mid in batch:
                 ch = sb.channel(f"tournament:{self.tid}:market:{mid}", {"config": {"private": True}})
                 ch.on_broadcast("market_batch", lambda m, mid=mid: self._on_batch(mid, m))
+                # Admin and settlement actions can still send these on their own, with no books:
+                # the book changed, so reload it.
+                ch.on_broadcast("book_dirty", lambda m, mid=mid: self._on_dirty(mid, "book_dirty"))
+                ch.on_broadcast("market_settled", lambda m, mid=mid: self._on_dirty(mid, "market_settled"))
                 self.joined[mid] = ch
             await asyncio.gather(*(self.joined[mid].subscribe(lambda st, err=None, mid=mid: self._on_state(mid, st, err))
                                    for mid in batch))
