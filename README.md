@@ -42,10 +42,26 @@ races and pending repairs, the races closest to triggering, the bot's orders, an
 positions from the exchange.
 
 Exits (`ARB_EXIT`, on by default): a NO basket you hold pays `k−1` per set at settlement, and
-selling it pays `Σ(1 − ask)` now. When the YES asks across the race sum below `1 − ARB_MIN_PROFIT`,
-selling beats holding, so the bot sells: the extra profit is riskless and the capital comes back.
+selling it pays `Σ(1 − ask)` now. The bot sells as soon as that locks in `ARB_EXIT_MIN_PROFIT`
+(0.005) per set over what the set cost, taking a smaller profit now and freeing the capital
+(`ARB_EXIT_EARLY=false` turns this off). It also sells whenever selling beats holding to settlement
+by `ARB_MIN_PROFIT`, which is riskless extra profit.
 Holdings come from the exchange's positions, and only races held evenly on every leg count, so
 your own manual trades are never touched.
+
+Passive quotes (`--quote`, off by default): instead of waiting for both sides of a race to be
+mispriced at once, the bot rests a buy-NO order on one party at `p = (k−1) − Σ other legs' NO asks −
+ARB_QUOTE_EDGE`, inside that party's spread. When it fills, the fill becomes a repair, and the bot
+buys the other legs' NO right away, paying at most break-even plus `ARB_REPAIR_SLIPPAGE`. Quotes are
+pulled the moment a fill would no longer earn the edge, and while a race is being hedged. The risk is
+the moment between a fill and its hedge; `ARB_QUOTE_SIZE` (200) bounds it per race. In paper mode a
+quote "fills" when a trade prints at its price, which ignores queue position, so paper fill counts
+are optimistic.
+
+```bash
+sigbot arb --quote           # paper: logs quotes and simulated fills/profit
+sigbot arb --live --quote    # real resting orders
+```
 
 YES baskets (asks summing below 1) are off by default: they lose if an unlisted candidate wins.
 Exits capture the same mispricing without that risk, because they only close NO you already hold.

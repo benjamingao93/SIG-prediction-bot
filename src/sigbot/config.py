@@ -31,12 +31,21 @@ class ArbConfig:
     max_capital: float = 50_000.0  # total cost of baskets bought per session
     allow_yes: bool = False  # YES baskets assume one listed party wins: not riskless
     exit_enabled: bool = True  # sell held NO baskets when that beats holding to settlement
+    exit_early: bool = True  # ...or as soon as selling locks in exit_min_profit over cost
+    exit_min_profit: float = 0.005  # per set, over cost
     poll_seconds: float = 4.0
     basket_cooldown: float = 10.0  # let the book refresh after trading a basket
     order_ttl: int = 15  # seconds: a new basket that can't execute this fast should expire
     repair_ttl: int = 120  # repairs are capped at break-even, so they can wait out a slow exchange
     repair_slippage: float = 0.02  # max loss per share accepted to finish hedging a lopsided fill
     max_book_age: float = 2.0  # seconds: skip a trade whose books went stale waiting on the rate limit
+    quoting: bool = False  # passive quotes: `sigbot arb --quote`
+    quote_races: int = 3  # races quoted at once
+    quote_size: int = 200  # sets per quote: the most a race can be one-sided if its hedge fails
+    quote_edge: float = 0.005  # profit per set if a fill is hedged at the prices it was quoted from
+    quote_ttl: int = 180  # seconds a quote rests before expiring by itself (orphans clean up)
+    quote_min_life: int = 20  # seconds before repricing a quote upward (saves writes)
+    quote_writes_per_cycle: int = 4
 
 
 @dataclass(frozen=True)
@@ -88,9 +97,16 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         max_capital=_f("ARB_MAX_CAPITAL", a.max_capital),
         allow_yes=os.environ.get("ARB_YES_BASKETS", "").strip().lower() in ("1", "true", "yes"),
         exit_enabled=os.environ.get("ARB_EXIT", "true").strip().lower() in ("1", "true", "yes"),
+        exit_early=os.environ.get("ARB_EXIT_EARLY", "true").strip().lower() in ("1", "true", "yes"),
+        exit_min_profit=_f("ARB_EXIT_MIN_PROFIT", a.exit_min_profit),
         poll_seconds=_f("ARB_POLL_SECONDS", a.poll_seconds),
         repair_slippage=_f("ARB_REPAIR_SLIPPAGE", a.repair_slippage),
         max_book_age=_f("ARB_MAX_BOOK_AGE", a.max_book_age),
+        quote_races=int(_f("ARB_QUOTE_RACES", a.quote_races)),
+        quote_size=int(_f("ARB_QUOTE_SIZE", a.quote_size)),
+        quote_edge=_f("ARB_QUOTE_EDGE", a.quote_edge),
+        quote_ttl=int(_f("ARB_QUOTE_TTL", a.quote_ttl)),
+        quote_min_life=int(_f("ARB_QUOTE_MIN_LIFE", a.quote_min_life)),
     )
     return Settings(
         api_key=api_key,

@@ -116,6 +116,10 @@ footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
       <h2>Held baskets <span id="held-note"></span></h2>
       <div class="scroll" id="held"></div>
     </section>
+    <section class="panel" id="quotes-panel" style="display:none">
+      <h2>Resting quotes <span id="quotes-note"></span></h2>
+      <div class="scroll" id="quotes"></div>
+    </section>
     <section class="panel">
       <h2>Bot orders <span>from the bot's log</span></h2>
       <div class="scroll" id="orders"></div>
@@ -205,18 +209,32 @@ function render(d) {
     S ? "No quotes yet." : "Waiting for the bot's first heartbeat.");
 
   // held baskets: exiting beats holding once Σ asks drops below the exit trigger
-  const exitAt = 1 - (S?.min_profit ?? 0.005);
   const H = S?.held || [];
   const lockedTotal = H.reduce((t, h) => t + (h.locked || 0), 0);
   $("held-note").textContent = S?.exit_enabled === false ? "exits off (ARB_EXIT)" :
-    `locked ${lockedTotal >= 0 ? "+" : ""}${num(lockedTotal, 2)} · exits when Σ asks < ${exitAt.toFixed(3)} · ${num(S?.exits || 0)} exits`;
+    `locked ${lockedTotal >= 0 ? "+" : ""}${num(lockedTotal, 2)} · sells once a sale locks in profit · ${num(S?.exits || 0)} exits`;
   $("held").innerHTML = table(
-    [["Race"], ["Sets", "num"], ["Cost/set", "num"], ["Locked", "num"], ["Σ asks", "num"], ["To exit", "num"]],
+    [["Race"], ["Sets", "num"], ["Cost/set", "num"], ["Locked", "num"], ["Σ asks", "num"], ["Exits at Σ asks ≤", "num"], ["Gap", "num"]],
     H.map((h) => `<tr><td>${esc(raceName(h.title))}</td><td class="num">${num(h.sets)}</td>` +
       `<td class="num">${num(h.cost_per_set, 4)}</td><td class="num">${signed(h.locked)}</td>` +
       `<td class="num">${num(h.sum_ask, 3)}</td>` +
-      `<td class="num">${h.sum_ask == null ? "–" : signed(exitAt - h.sum_ask, 3)}</td></tr>`),
+      `<td class="num">${num(h.exit_at, 3)}</td>` +
+      `<td class="num">${h.sum_ask == null || h.exit_at == null ? "–" : signed(h.exit_at - h.sum_ask, 3)}</td></tr>`),
     S ? "No baskets held (positions refresh once a minute)." : "Waiting for the bot's first heartbeat.");
+
+  // resting quotes (sigbot arb --quote)
+  const QS = S?.quoting;
+  $("quotes-panel").style.display = QS ? "" : "none";
+  if (QS) {
+    const sim = S.mode === "paper" ? ` · simulated P&L ${QS.paper_pnl >= 0 ? "+" : ""}${num(QS.paper_pnl, 2)}` : "";
+    $("quotes-note").textContent = `${num(QS.placed)} placed · ${num(QS.fills)} fills (${num(QS.filled_sets)} sets)${sim}`;
+    $("quotes").innerHTML = table(
+      [["Race"], ["Bid NO on"], ["Price", "num"], ["Size", "num"], ["Filled", "num"], ["Age"], ["Edge if filled now", "num"]],
+      QS.active.map((q) => `<tr><td>${esc(raceName(q.title))}</td><td>${esc((q.title.match(/the (\w+) Party/) || [])[1] || "")}</td>` +
+        `<td class="num">${num(q.price, 3)}</td><td class="num">${num(q.size)}</td><td class="num">${num(q.filled)}</td>` +
+        `<td>${dur(q.age)}</td><td class="num">${signed(q.edge_now, 3)}</td></tr>`),
+      "No quotes resting right now.");
+  }
 
   // bot orders
   $("orders").innerHTML = table(
@@ -225,6 +243,8 @@ function render(d) {
       const st = o.mode === "paper" ? '<span class="tag paper">paper</span>' :
         o.status === "sent" ? '<span class="tag ok">sent</span>' :
         o.status === "exit" ? '<span class="tag ok">exit</span>' :
+        o.status === "quote" ? '<span class="tag paper">quote</span>' :
+        /quote-fill/.test(o.status) ? '<span class="tag ok">quote fill</span>' :
         o.status === "repair" ? '<span class="tag paper">repair</span>' : `<span class="tag err">${esc(o.status)}</span>`;
       return `<tr><td>${time(o.time)}</td><td>${esc(o.race)}</td><td>${o.action === "sell" ? "sell " : "buy "}<span class="tag ${o.side}">${esc(o.side)}</span></td>` +
         `<td class="num">${num(o.sets)}</td><td class="mono">${o.prices.map((p) => num(p, 3)).join(" + ")}</td>` +

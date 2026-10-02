@@ -98,6 +98,7 @@ def live_bot(monkeypatch, tmp_path, fills, books=None, fills_api=None):
     bot.live, bot.cfg, bot.tid = True, ArbConfig(), "t"
     bot.cash, bot.spent, bot.repairs, bot.stale_skips = 1e6, 0.0, {}, 0
     bot.held, bot.held_cost, bot.exits, bot._positions_at = {}, {}, 0, time.monotonic()
+    bot.quoter = None
     b = arb.build_baskets([market("1", "Democratic"), market("2", "Republican")])[0]
     # planned: 100 sets at .38 + .61 = .99 → +.01 per set
     return bot, fake, arb.ArbOrder(b, "no", 100, (.38, .61), 99.0)
@@ -201,22 +202,50 @@ def test_held_baskets_need_even_no_on_every_leg():
     assert arb.held_baskets([b], {"e1": 100}) == {}  # one leg only
 
 
-def test_screen_exit_needs_asks_below_one_minus_min_profit():
+def test_exit_bar_is_the_lower_of_beat_holding_and_beat_cost():
     b = two_leg_basket()
-    assert arb.screen_exit(b, {"e1": (.6, .61), "e2": (.38, .385)}, .005) is None  # Σask .995
-    assert arb.screen_exit(b, {"e1": (.6, .61), "e2": (.37, .38)}, .005) == pytest.approx(.01)
-    assert arb.screen_exit(b, {"e1": (.6, None), "e2": (.37, .38)}, .005) is None
+    assert arb.exit_bar(b, None, .005, .005) == pytest.approx(1.005)  # cost unknown: beat holding only
+    assert arb.exit_bar(b, .99, .005, None) == pytest.approx(1.005)  # early exits off
+    assert arb.exit_bar(b, .99, .005, .005) == pytest.approx(.995)  # early: cost .99 + .005
+    assert arb.exit_bar(b, 1.006, .005, .005) == pytest.approx(1.005)  # a losing set: only beat holding
 
 
-def test_size_exit_walks_asks_and_caps_at_held_sets():
+def test_screen_exit_against_the_bar():
+    b = two_leg_basket()
+    # proceeds = Σ(1 − ask): asks .61 + .395 → .995
+    q = {"e1": (.6, .61), "e2": (.38, .395)}
+    assert arb.screen_exit(b, q, bar=1.005) is None  # doesn't beat holding
+    assert arb.screen_exit(b, q, bar=.995) == pytest.approx(0)  # exactly the early-exit bar: sell
+    assert arb.screen_exit(b, q, bar=.996) is None
+    assert arb.screen_exit(b, {"e1": (.6, None), "e2": (.38, .395)}, bar=.9) is None
+
+
+def test_size_exit_walks_asks_until_the_bar_and_caps_at_held_sets():
     b = two_leg_basket()
     # selling NO = 1 − YES ask: e1 .40 (100) then .395; e2 .61 (300) then .60
     books = {"e1": book("e1", asks=[(.60, 100), (.605, 500)]), "e2": book("e2", asks=[(.39, 300), (.40, 50)])}
-    o = arb.size_exit(b, books, held_sets=10_000, min_profit=.005, max_sets=10_000)
-    # 1-100: .40+.61=1.01 → +.01; 101-300: .395+.61=1.005 → not > .005: stop
-    assert o.sets == 100 and o.limits == (pytest.approx(.40), pytest.approx(.61))
-    assert o.proceeds == pytest.approx(101) and o.gain == pytest.approx(1)
-    assert arb.size_exit(b, books, held_sets=40, min_profit=.005, max_sets=10_000).sets == 40
+    o = arb.size_exit(b, books, held_sets=10_000, bar=1.005, max_sets=10_000)
+    # beat holding: 1-100 at 1.01 ✓; 101-300 at 1.005 ✓ (meets the bar); then .395+.60 = .995 ✗
+    assert o.sets == 300 and o.proceeds == pytest.approx(100 * 1.01 + 200 * 1.005)
+    early = arb.size_exit(b, books, held_sets=10_000, bar=.995, max_sets=10_000, cost_per_set=.99)
+    assert early.sets == 350 and early.realized == pytest.approx(early.proceeds - 350 * .99)
+    assert arb.size_exit(b, books, held_sets=40, bar=1.005, max_sets=10_000).sets == 40
+
+
+def test_step_takes_an_early_exit_when_a_sale_beats_cost(monkeypatch, tmp_path):
+    quotes = [{"exchangeId": "e1", "bestBid": .59, "bestAsk": .61}, {"exchangeId": "e2", "bestBid": .38, "bestAsk": .395}]
+    books = {"e1": book("e1", asks=[(.61, 1000)]), "e2": book("e2", asks=[(.395, 1000)])}
+    bot, fake, _ = live_bot(monkeypatch, tmp_path, [[50, 50]], books)
+    monkeypatch.setattr(arb_bot.mk, "bulk_prices", lambda c, ids, tid: quotes)
+    bot.baskets = [two_leg_basket()]
+    bot.held, bot.held_cost = {"S-TX": 50}, {"S-TX": .99}  # proceeds .995 = cost + .005
+    bot._last_refresh, bot._last_trade, bot._quotes = time.monotonic(), {}, {}
+    bot.cfg = ArbConfig(exit_early=False)
+    bot.step()
+    assert fake.calls == []  # doesn't beat holding (needs 1.005)
+    bot.cfg, bot._last_trade = ArbConfig(), {}
+    bot.step()
+    assert fake.calls[0][0]["action"] == "sell" and fake.calls[0][0]["quantity"] == 50
 
 
 def test_live_exit_sends_sell_legs(monkeypatch, tmp_path):

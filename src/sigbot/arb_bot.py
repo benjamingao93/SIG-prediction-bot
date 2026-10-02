@@ -17,10 +17,13 @@ Live execution:
      book, up to a cap: break-even for the basket plus ARB_REPAIR_SLIPPAGE. A race with a repair
      pending gets no new trades. `sigbot hedge` registers a repair for a gap made any other way.
   5. Exits: a NO basket we hold pays k−1 per set at settlement; selling NO on every leg pays
-     Σ(1 − ask_i) now. When the YES asks sum below 1 − ARB_MIN_PROFIT, selling beats holding,
-     so the bot sells (same budget, freshness and repair handling as buys). Holdings come from
+     Σ(1 − ask_i) now. The bot sells once that beats holding by ARB_MIN_PROFIT, or (early exits,
+     on by default) beats what the set cost by ARB_EXIT_MIN_PROFIT (same budget, freshness and
+     repair handling as buys). Holdings come from
      the exchange's positions; only races held evenly on every leg count as baskets.
-The kill switch blocks every order, repairs and exits included.
+  6. Quotes (`--quote`, quoter.py): resting buy-NO orders on one leg, hedged through repairs
+     when they fill.
+The kill switch blocks every order, repairs and exits included, and cancels resting quotes.
 """
 from __future__ import annotations
 
@@ -64,6 +67,10 @@ class ArbBot:
         self._positions_at = 0.0
         self.last_error: Optional[str] = None
         self.started = time.time()
+        self.quoter = None
+        if self.cfg.quoting:
+            from .quoter import Quoter
+            self.quoter = Quoter(self)
 
     # ---- setup ----
 
@@ -133,11 +140,14 @@ class ArbBot:
             for race in list(self.repairs):
                 self.work_repair(race)
         ex_ids = [l.exchange_id for b in self.baskets for l in b.legs]
-        quotes = arb.quotes_from_prices(mk.bulk_prices(self.client, ex_ids, self.tid))
+        rows = mk.bulk_prices(self.client, ex_ids, self.tid)
+        quotes = arb.quotes_from_prices(rows)
         self._quotes = quotes
         traded = 0
         if self.cfg.exit_enabled:
             traded += self._exits(quotes)
+        if self.quoter:
+            self.quoter.step(quotes, {str(r["exchangeId"]): r.get("latestPrice") for r in rows})
         flagged = []
         for b in self.baskets:
             if b.key in self.repairs:
@@ -163,8 +173,13 @@ class ArbBot:
                 traded += 1
         return traded
 
+    def _exit_bar(self, b: Basket) -> float:
+        early = self.cfg.exit_min_profit if self.cfg.exit_early else None
+        return arb.exit_bar(b, self.held_cost.get(b.key), self.cfg.min_profit, early)
+
     def _exits(self, quotes) -> int:
-        """Sell held baskets whose YES asks sum below 1 − min_profit: beats holding to settlement."""
+        """Sell held baskets once selling beats holding to settlement, or (early exits) locks in
+        exit_min_profit per set over what they cost."""
         self.refresh_positions()
         by_key = {b.key: b for b in self.baskets}
         flagged = []
@@ -172,11 +187,13 @@ class ArbBot:
             b = by_key.get(race)
             if b is None or race in self.repairs:
                 continue
+            if self.quoter and race in self.quoter.active:
+                continue  # selling NO could run into our own resting NO bid
             if time.monotonic() - self._last_trade.get(race, -1e9) < self.cfg.basket_cooldown:
                 continue
-            gain = arb.screen_exit(b, quotes, self.cfg.min_profit)
-            if gain is not None:
-                flagged.append((gain, b, sets))
+            margin = arb.screen_exit(b, quotes, self._exit_bar(b))
+            if margin is not None:
+                flagged.append((margin, b, sets))
         done = 0
         for _, b, sets in sorted(flagged, key=lambda f: -f[0]):
             if self.s.kill_switch.exists():
@@ -186,7 +203,7 @@ class ArbBot:
                 break
             self._last_trade[b.key] = time.monotonic()
             books, read_at = self._books([l.exchange_id for l in b.legs])
-            order = arb.size_exit(b, books, sets, self.cfg.min_profit, self.cfg.max_sets)
+            order = arb.size_exit(b, books, sets, self._exit_bar(b), self.cfg.max_sets, self.held_cost.get(b.key))
             if order is None or self._stale(read_at, f"exit {b.key}"):
                 continue
             if self.execute_exit(order):
@@ -248,9 +265,12 @@ class ArbBot:
     def execute_exit(self, order: ExitOrder) -> bool:
         b = order.basket
         cost_per_set = self.held_cost.get(b.key, 0.0)
+        realized = order.realized
         desc = (f"{b.key} SELL NO×{len(b.legs)} sets={order.sets} proceeds={order.proceeds:.2f} "
-                f"vs hold {order.sets * b.payout('no'):.0f}: gain={order.gain:+.2f} limits={list(order.limits)}")
-        per_set = order.gain / order.sets
+                f"(cost {order.sets * cost_per_set:.2f}, hold {order.sets * b.payout('no'):.0f}): "
+                f"profit={realized if realized is not None else float('nan'):+.2f} vs holding {order.gain:+.2f} "
+                f"limits={list(order.limits)}")
+        per_set = (realized if realized is not None else order.gain) / order.sets
         mode = "live" if self.live else "paper"
 
         def log_legs(status, response=None):
@@ -396,6 +416,7 @@ class ArbBot:
             "poll_seconds": self.cfg.poll_seconds, "allow_yes": self.cfg.allow_yes,
             "frozen": sorted(self.repairs), "stale_skips": self.stale_skips, "last_error": self.last_error,
             "exits": self.exits, "exit_enabled": self.cfg.exit_enabled,
+            "quoting": self.quoter.status(self._quotes) if self.quoter else None,
             "held": self._held_status(),
             "kill_switch": self.s.kill_switch.exists(), "opportunities": opps[:25],
         })
@@ -410,7 +431,9 @@ class ArbBot:
             cost = self.held_cost.get(b.key)
             out.append({"race": b.key, "title": b.legs[0].title, "sets": n, "cost_per_set": cost,
                         "locked": n * (b.payout("no") - cost) if cost is not None else None,
-                        "sum_ask": sum(asks) if all(a is not None for a in asks) else None})
+                        "sum_ask": sum(asks) if all(a is not None for a in asks) else None,
+                        # exits once Σ YES asks ≤ this (proceeds Σ(1 − ask) reach the bar)
+                        "exit_at": round(len(b.legs) - self._exit_bar(b), 6)})
         return out
 
     # ---- main loop ----
@@ -419,6 +442,15 @@ class ArbBot:
         self.refresh()
         for v in arb.violations(self.client, self.tid):
             log.info("engine-reported violation: %s", v.get("reason"))
+        if self.quoter:
+            self.quoter.startup()
+        try:
+            self._loop(max_cycles)
+        finally:
+            if self.quoter:
+                self.quoter.cancel_all("bot stopping")
+
+    def _loop(self, max_cycles: Optional[int]) -> None:
         n = 0
         while max_cycles is None or n < max_cycles:
             t0 = time.monotonic()

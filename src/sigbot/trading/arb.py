@@ -152,10 +152,12 @@ def size(basket: Basket, side: str, books: Dict[str, OrderBook], min_profit: flo
 
 # ---- exits: selling a NO basket we hold ----
 #
-# Holding a NO basket pays k−1 per set at settlement. Selling NO on every leg pays Σ(1 − ask_i)
-# now, which beats holding when the YES asks sum below 1: extra riskless profit 1 − Σask per
-# set, and the capital comes back. Only ever closes NO we hold, so unlike the YES basket it
-# needs no assumption about who can win.
+# Selling NO on every leg pays Σ(1 − ask_i) per set now. Two reasons to sell:
+#   - it beats holding: the proceeds exceed the k−1 settlement payout (YES asks sum below 1),
+#     riskless extra profit;
+#   - early profit (ARB_EXIT_EARLY): the proceeds exceed what the set cost by
+#     ARB_EXIT_MIN_PROFIT, taking a smaller profit now and freeing the capital.
+# Either way the bot only closes NO it holds, so it needs no assumption about who can win.
 
 @dataclass(frozen=True)
 class ExitOrder:
@@ -163,11 +165,27 @@ class ExitOrder:
     sets: int
     limits: Tuple[float, ...]  # per leg: lowest NO price we sell at
     proceeds: float
+    cost_per_set: Optional[float] = None
 
     @property
     def gain(self) -> float:
         """Over holding to settlement."""
         return self.proceeds - self.sets * self.basket.payout("no")
+
+    @property
+    def realized(self) -> Optional[float]:
+        """Profit over what the sets cost."""
+        return None if self.cost_per_set is None else self.proceeds - self.sets * self.cost_per_set
+
+
+def exit_bar(basket: Basket, cost_per_set: Optional[float], min_profit: float,
+             early_min_profit: Optional[float]) -> float:
+    """Proceeds per set a sale must reach: beat holding by min_profit, or, with early exits on
+    and a known cost, beat the cost by early_min_profit, whichever is lower."""
+    bar = basket.payout("no") + min_profit
+    if early_min_profit is not None and cost_per_set is not None:
+        bar = min(bar, cost_per_set + early_min_profit)
+    return bar
 
 
 def held_baskets(baskets: Iterable[Basket], no_held: Dict[str, float]) -> Dict[str, int]:
@@ -182,23 +200,23 @@ def held_baskets(baskets: Iterable[Basket], no_held: Dict[str, float]) -> Dict[s
 
 
 def screen_exit(basket: Basket, quotes: Dict[str, Tuple[Optional[float], Optional[float]]],
-                min_profit: float) -> Optional[float]:
-    """Gain per set over holding at the top of the book, if it clears min_profit."""
+                bar: float) -> Optional[float]:
+    """Top-of-book proceeds per set over the bar, if a sale reaches it."""
     asks = [quotes.get(l.exchange_id, (None, None))[1] for l in basket.legs]
     if any(a is None for a in asks):
         return None
-    gain = 1 - sum(asks)
-    return gain if gain > min_profit + 1e-9 else None
+    margin = sum(1 - a for a in asks) - bar
+    return margin if margin > -1e-9 else None
 
 
-def size_exit(basket: Basket, books: Dict[str, OrderBook], held_sets: int, min_profit: float,
-              max_sets: int) -> Optional[ExitOrder]:
-    """Sell NO by walking each leg's YES asks (selling NO at p ≡ buying YES at 1 − p)."""
-    hold = basket.payout("no")
+def size_exit(basket: Basket, books: Dict[str, OrderBook], held_sets: int, bar: float,
+              max_sets: int, cost_per_set: Optional[float] = None) -> Optional[ExitOrder]:
+    """Sell NO by walking each leg's YES asks (selling NO at p ≡ buying YES at 1 − p) while each
+    set's proceeds still reach the bar."""
     ladders = [[Level(round(1 - a.price, 6), a.quantity) for a in books[l.exchange_id].asks]
                for l in basket.legs]
-    r = _walk(ladders, lambda prices: sum(prices) - hold, min_profit, min(held_sets, max_sets))
-    return ExitOrder(basket, r[0], r[1], r[2]) if r else None
+    r = _walk(ladders, lambda prices: sum(prices) - bar, -2e-9, min(held_sets, max_sets))
+    return ExitOrder(basket, r[0], r[1], r[2], cost_per_set) if r else None
 
 
 def quotes_from_prices(rows: Sequence[Dict[str, Any]]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:

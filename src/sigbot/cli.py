@@ -5,8 +5,10 @@
   sigbot races                 rebuild data/races.csv (PVI, incumbents) from Wikipedia
   sigbot fundamentals          fundamentals model vs market price, biggest gaps first
   sigbot collect [--realtime]  stage 1: record prices/books, no trading
+  sigbot feed                  realtime book feed, listen-only: logs what the arb bot would do
   sigbot arb                   arbitrage: paper (logs baskets it would buy, sends nothing)
   sigbot arb --live            arbitrage with real orders (also requires MODE=live in .env)
+  sigbot arb --quote           also rest passive quotes (paper: simulated fills; add --live for real)
   sigbot hedge RACE --max-price P   have the arb bot finish hedging an uneven race (NO side)
   sigbot dashboard             local dashboard at http://localhost:8050 (read-only)
   sigbot run                   model strategy, paper trading (logs signals, sends nothing)
@@ -114,13 +116,19 @@ def cmd_collect(s: Settings, a) -> None:
     tid = mk.get_tournament(c, slug)["id"]
     col = Collector(c, db, slug, tid)
     if a.realtime:
-        from .api.realtime import RealtimeBooks
+        from .api.realtime import FeedRunner
         col.refresh_markets()
-        rt = RealtimeBooks(c, tid, list(col.markets), on_book=col.set_book,
-                           on_resync=lambda mid: col.markets.get(mid) and col.fetch_book(col.markets[mid].yes_exchange_id))
+        rt = FeedRunner(c, tid, list(col.markets))
+        rt.on_change = lambda exs: [col.set_book(rt.store.books[ex]) for ex in exs]
         asyncio.run(rt.run())
     else:
         col.run(max_cycles=a.cycles)
+
+
+def cmd_feed(s: Settings, a) -> None:
+    from .feed_shadow import run_shadow
+    _require_slug(s)
+    run_shadow(s, read_budget=a.read_budget, minutes=a.minutes)
 
 
 def cmd_run(s: Settings, a) -> None:
@@ -135,8 +143,11 @@ def cmd_run(s: Settings, a) -> None:
 
 
 def cmd_arb(s: Settings, a) -> None:
+    from dataclasses import replace
     from .arb_bot import ArbBot
     live = a.live
+    if a.quote:  # one more read per cycle for fills: slow the poll a little
+        s = replace(s, arb=replace(s.arb, quoting=True, poll_seconds=max(s.arb.poll_seconds, 5.0)))
     if live and s.mode != "live":
         raise SystemExit("--live also requires MODE=live in .env. Refusing to send orders.")
     _require_slug(s)
@@ -238,9 +249,13 @@ def main(argv=None) -> None:
     f = sub.add_parser("fundamentals"); f.add_argument("--top", type=int, default=60); f.set_defaults(fn=cmd_fundamentals)
     c = sub.add_parser("collect"); c.add_argument("--realtime", action="store_true")
     c.add_argument("--cycles", type=int); c.set_defaults(fn=cmd_collect)
+    fd = sub.add_parser("feed"); fd.add_argument("--read-budget", type=int, default=15,
+                                                 help="REST reads/min for initial loads and checks (shared account limit is 100)")
+    fd.add_argument("--minutes", type=float); fd.set_defaults(fn=cmd_feed)
     r = sub.add_parser("run"); r.add_argument("--live", action="store_true")
     r.add_argument("--cycles", type=int); r.set_defaults(fn=cmd_run)
     ar = sub.add_parser("arb"); ar.add_argument("--live", action="store_true")
+    ar.add_argument("--quote", action="store_true", help="rest passive quotes (paper unless --live)")
     ar.add_argument("--cycles", type=int); ar.set_defaults(fn=cmd_arb)
     h = sub.add_parser("hedge"); h.add_argument("race"); h.add_argument("--max-price", type=float)
     h.add_argument("--cancel", action="store_true"); h.set_defaults(fn=cmd_hedge)

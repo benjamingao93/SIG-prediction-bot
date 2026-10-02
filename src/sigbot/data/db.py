@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS signals (
     p_model REAL, p_market REAL, uncertainty REAL, edge REAL,
     status TEXT, order_id TEXT, response TEXT
 );
+CREATE TABLE IF NOT EXISTS arb_quotes (
+    race TEXT PRIMARY KEY, data TEXT, updated TEXT
+);
 CREATE TABLE IF NOT EXISTS arb_repairs (
     race TEXT PRIMARY KEY, data TEXT, created TEXT, updated TEXT
 );
@@ -127,6 +130,37 @@ class DB:
 
     def delete_repair(self, race: str) -> None:
         self.conn.execute("DELETE FROM arb_repairs WHERE race=?", (race,))
+        self.conn.commit()
+
+    def add_to_repair(self, race: str, side: str, legs: Iterable[Dict[str, Any]], source: str) -> Dict[str, Any]:
+        """Add shortfalls to a race's repair, creating it if needed. A leg that already has one
+        gets the quantities summed and the caps averaged by quantity."""
+        rep = self.get_repairs().get(race) or {"side": side, "legs": [], "source": source}
+        rep.pop("created", None)
+        rep.pop("updated", None)
+        by_ex = {l["exchange_id"]: l for l in rep["legs"]}
+        for new in legs:
+            old = by_ex.get(new["exchange_id"])
+            if old is None or old["short"] < 1:
+                by_ex[new["exchange_id"]] = dict(new)
+            else:
+                total = old["short"] + new["short"]
+                old["cap"] = round((old["cap"] * old["short"] + new["cap"] * new["short"]) / total, 3)
+                old["short"] = total
+        rep["legs"] = list(by_ex.values())
+        self.save_repair(race, rep)
+        return rep
+
+    def get_quotes(self) -> Dict[str, Dict[str, Any]]:
+        """Quotes the arb bot has resting (or had, if it stopped without cancelling)."""
+        return {r["race"]: json.loads(r["data"]) for r in self.conn.execute("SELECT * FROM arb_quotes")}
+
+    def save_quote(self, race: str, data: Dict[str, Any]) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO arb_quotes VALUES (?,?,?)", (race, json.dumps(data), now_iso()))
+        self.conn.commit()
+
+    def delete_quote(self, race: str) -> None:
+        self.conn.execute("DELETE FROM arb_quotes WHERE race=?", (race,))
         self.conn.commit()
 
     def get_status(self) -> Optional[Dict[str, Any]]:
