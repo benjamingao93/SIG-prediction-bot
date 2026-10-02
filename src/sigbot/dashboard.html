@@ -113,6 +113,10 @@ footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
       <div class="scroll" id="opps"></div>
     </section>
     <section class="panel">
+      <h2>Held baskets <span id="held-note"></span></h2>
+      <div class="scroll" id="held"></div>
+    </section>
+    <section class="panel">
       <h2>Bot orders <span>from the bot's log</span></h2>
       <div class="scroll" id="orders"></div>
     </section>
@@ -200,14 +204,29 @@ function render(d) {
     }),
     S ? "No quotes yet." : "Waiting for the bot's first heartbeat.");
 
+  // held baskets: exiting beats holding once Σ asks drops below the exit trigger
+  const exitAt = 1 - (S?.min_profit ?? 0.005);
+  const H = S?.held || [];
+  const lockedTotal = H.reduce((t, h) => t + (h.locked || 0), 0);
+  $("held-note").textContent = S?.exit_enabled === false ? "exits off (ARB_EXIT)" :
+    `locked ${lockedTotal >= 0 ? "+" : ""}${num(lockedTotal, 2)} · exits when Σ asks < ${exitAt.toFixed(3)} · ${num(S?.exits || 0)} exits`;
+  $("held").innerHTML = table(
+    [["Race"], ["Sets", "num"], ["Cost/set", "num"], ["Locked", "num"], ["Σ asks", "num"], ["To exit", "num"]],
+    H.map((h) => `<tr><td>${esc(raceName(h.title))}</td><td class="num">${num(h.sets)}</td>` +
+      `<td class="num">${num(h.cost_per_set, 4)}</td><td class="num">${signed(h.locked)}</td>` +
+      `<td class="num">${num(h.sum_ask, 3)}</td>` +
+      `<td class="num">${h.sum_ask == null ? "–" : signed(exitAt - h.sum_ask, 3)}</td></tr>`),
+    S ? "No baskets held (positions refresh once a minute)." : "Waiting for the bot's first heartbeat.");
+
   // bot orders
   $("orders").innerHTML = table(
-    [["Time"], ["Race"], ["Buy"], ["Sets", "num"], ["Leg prices"], ["Profit", "num"], ["Status"]],
+    [["Time"], ["Race"], ["Trade"], ["Sets", "num"], ["Leg prices"], ["Profit", "num"], ["Status"]],
     L.orders.map((o) => {
       const st = o.mode === "paper" ? '<span class="tag paper">paper</span>' :
         o.status === "sent" ? '<span class="tag ok">sent</span>' :
+        o.status === "exit" ? '<span class="tag ok">exit</span>' :
         o.status === "repair" ? '<span class="tag paper">repair</span>' : `<span class="tag err">${esc(o.status)}</span>`;
-      return `<tr><td>${time(o.time)}</td><td>${esc(o.race)}</td><td><span class="tag ${o.side}">${esc(o.side)}</span></td>` +
+      return `<tr><td>${time(o.time)}</td><td>${esc(o.race)}</td><td>${o.action === "sell" ? "sell " : "buy "}<span class="tag ${o.side}">${esc(o.side)}</span></td>` +
         `<td class="num">${num(o.sets)}</td><td class="mono">${o.prices.map((p) => num(p, 3)).join(" + ")}</td>` +
         `<td class="num">${signed(o.planned_profit)}</td><td>${st}</td></tr>`;
     }),

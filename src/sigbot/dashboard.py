@@ -139,6 +139,7 @@ def local_state(db: DB, s: Settings) -> Dict[str, Any]:
             continue  # model-strategy signals, not arb
         key = (r["ts"], basket, r["mode"])
         o = orders.setdefault(key, {"time": r["ts"], "race": basket, "mode": r["mode"], "side": r["side"],
+                                    "action": r["action"] or "buy",
                                     "sets": r["quantity"], "status": r["status"], "prices": [],
                                     "profit_per_set": r["edge"]})
         o["prices"].append(r["price"])

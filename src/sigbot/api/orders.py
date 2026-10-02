@@ -59,9 +59,10 @@ def place_multi_leg(
     ttl_seconds: Optional[int] = 30,
     idempotency_key: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Up to 10 limit buys, atomically: every leg is placed or none is. Placement is atomic,
+    """Up to 10 limit orders, atomically: every leg is placed or none is. Placement is atomic,
     fills are not: a leg whose limit no longer crosses the book rests (`open: true`).
-    legs: [{"exchangeId", "side", "quantity", "price"}]. Returns per-leg result data, in order."""
+    legs: [{"exchangeId", "side", "quantity", "price", "action"?}], action defaulting to "buy".
+    Returns per-leg result data, in order."""
     if not 1 <= len(legs) <= 10:
         raise ValueError("multi-leg orders take 1-10 legs")
     exp = None
@@ -72,8 +73,11 @@ def place_multi_leg(
     for leg in legs:
         if leg["quantity"] <= 0:
             raise ValueError("quantity must be positive")
-        b = {"exchangeId": str(leg["exchangeId"]), "side": leg["side"], "action": "buy",
-             "quantity": int(leg["quantity"]), "price": round_to_tick(leg["price"], "buy"),
+        action = leg.get("action", "buy")
+        if action not in ("buy", "sell"):
+            raise ValueError(f"bad action {action}")
+        b = {"exchangeId": str(leg["exchangeId"]), "side": leg["side"], "action": action,
+             "quantity": int(leg["quantity"]), "price": round_to_tick(leg["price"], action),
              "tournamentId": tournament_id}
         if exp:
             b["expirationDate"] = exp

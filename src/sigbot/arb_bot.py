@@ -16,7 +16,11 @@ Live execution:
      before looking for new trades, the bot buys what it can of each shortfall from the latest
      book, up to a cap: break-even for the basket plus ARB_REPAIR_SLIPPAGE. A race with a repair
      pending gets no new trades. `sigbot hedge` registers a repair for a gap made any other way.
-The kill switch blocks every order, repairs included.
+  5. Exits: a NO basket we hold pays k−1 per set at settlement; selling NO on every leg pays
+     Σ(1 − ask_i) now. When the YES asks sum below 1 − ARB_MIN_PROFIT, selling beats holding,
+     so the bot sells (same budget, freshness and repair handling as buys). Holdings come from
+     the exchange's positions; only races held evenly on every leg count as baskets.
+The kill switch blocks every order, repairs and exits included.
 """
 from __future__ import annotations
 
@@ -27,13 +31,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .api import markets as mk
 from .api import orders
+from .api import portfolio as pf
 from .api.client import SigAPIError, SigClient
 from .api.models import OrderBook
 from .data.db import DB
 from .config import Settings
 from .data.external.races import load_races
 from .trading import arb
-from .trading.arb import ArbOrder, Basket
+from .trading.arb import ArbOrder, Basket, ExitOrder
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +58,10 @@ class ArbBot:
         self.cycles = 0
         self.trades = 0
         self.stale_skips = 0
+        self.exits = 0
+        self.held: Dict[str, int] = {}  # race → NO sets held evenly on every leg
+        self.held_cost: Dict[str, float] = {}  # race → cost per set
+        self._positions_at = 0.0
         self.last_error: Optional[str] = None
         self.started = time.time()
 
@@ -68,6 +77,23 @@ class ArbBot:
         log.info("arb: %d baskets (%d exhaustive), cash=%.0f, spent=%.0f/%.0f",
                  len(self.baskets), sum(b.exhaustive for b in self.baskets), self.cash,
                  self.spent, self.cfg.max_capital)
+
+    def refresh_positions(self, force: bool = False) -> None:
+        """The NO baskets we hold, from the exchange (authoritative). Once a minute, or after a
+        trade. Uneven races and YES holdings (e.g. your own manual trades) aren't baskets."""
+        if not force and time.monotonic() - self._positions_at < 60:
+            return
+        if not self._can_read(1):
+            return
+        no_held, avg = {}, {}
+        for p in pf.positions(self.client, self.s.tournament_slug):
+            if p.side == "no" and not p.settled:
+                no_held[p.exchange_id] = abs(p.quantity)
+                avg[p.exchange_id] = p.avg_cost
+        self.held = arb.held_baskets(self.baskets, no_held)
+        self.held_cost = {b.key: sum(avg.get(l.exchange_id, 0.0) for l in b.legs)
+                          for b in self.baskets if b.key in self.held}
+        self._positions_at = time.monotonic()
 
     def _can_read(self, n: int) -> bool:
         """Room for n reads right now, keeping 3 back for the next cycle's bulk prices."""
@@ -110,6 +136,8 @@ class ArbBot:
         quotes = arb.quotes_from_prices(mk.bulk_prices(self.client, ex_ids, self.tid))
         self._quotes = quotes
         traded = 0
+        if self.cfg.exit_enabled:
+            traded += self._exits(quotes)
         flagged = []
         for b in self.baskets:
             if b.key in self.repairs:
@@ -134,6 +162,36 @@ class ArbBot:
             if self.execute(order):
                 traded += 1
         return traded
+
+    def _exits(self, quotes) -> int:
+        """Sell held baskets whose YES asks sum below 1 − min_profit: beats holding to settlement."""
+        self.refresh_positions()
+        by_key = {b.key: b for b in self.baskets}
+        flagged = []
+        for race, sets in self.held.items():
+            b = by_key.get(race)
+            if b is None or race in self.repairs:
+                continue
+            if time.monotonic() - self._last_trade.get(race, -1e9) < self.cfg.basket_cooldown:
+                continue
+            gain = arb.screen_exit(b, quotes, self.cfg.min_profit)
+            if gain is not None:
+                flagged.append((gain, b, sets))
+        done = 0
+        for _, b, sets in sorted(flagged, key=lambda f: -f[0]):
+            if self.s.kill_switch.exists():
+                log.warning("kill switch %s present: not exiting", self.s.kill_switch)
+                break
+            if not self._can_read(len(b.legs)):
+                break
+            self._last_trade[b.key] = time.monotonic()
+            books, read_at = self._books([l.exchange_id for l in b.legs])
+            order = arb.size_exit(b, books, sets, self.cfg.min_profit, self.cfg.max_sets)
+            if order is None or self._stale(read_at, f"exit {b.key}"):
+                continue
+            if self.execute_exit(order):
+                done += 1
+        return done
 
     def _fit_budget(self, order: ArbOrder, books) -> Optional[ArbOrder]:
         if self.s.kill_switch.exists():
@@ -180,10 +238,59 @@ class ArbBot:
         cost = sum(float(r.get("totalCost") or 0) for r in results)
         self.spent += cost
         self.cash -= cost
+        self._positions_at = 0.0  # re-read holdings next cycle
         log.info("LIVE ARB %s → filled %s", desc, filled)
         self._log(order, "sent", results)
         if max(filled) - min(filled) >= 1:
             self._open_repair(order, filled)
+        return True
+
+    def execute_exit(self, order: ExitOrder) -> bool:
+        b = order.basket
+        cost_per_set = self.held_cost.get(b.key, 0.0)
+        desc = (f"{b.key} SELL NO×{len(b.legs)} sets={order.sets} proceeds={order.proceeds:.2f} "
+                f"vs hold {order.sets * b.payout('no'):.0f}: gain={order.gain:+.2f} limits={list(order.limits)}")
+        per_set = order.gain / order.sets
+        mode = "live" if self.live else "paper"
+
+        def log_legs(status, response=None):
+            for leg, px in zip(b.legs, order.limits):
+                self.db.log_signal(mode=mode, market_id=leg.market_id, exchange_id=leg.exchange_id, side="no",
+                                   action="sell", price=px, quantity=order.sets, edge=per_set, status=status,
+                                   response={"basket": b.key, **({"r": response} if response else {})})
+
+        if not self.live:
+            log.info("PAPER EXIT %s", desc)
+            log_legs("paper")
+            self.exits += 1
+            return True
+        legs = [{"exchangeId": l.exchange_id, "side": "no", "action": "sell", "quantity": order.sets, "price": px}
+                for l, px in zip(b.legs, order.limits)]
+        try:
+            results = orders.place_multi_leg(self.client, legs, self.tid, ttl_seconds=self.cfg.order_ttl)
+        except SigAPIError as e:
+            log.error("exit rejected %s: %s", desc, e)
+            log_legs(f"error:{e.code}", {"message": e.message, "details": e.details})
+            return False
+        sold = [self._settle_leg(r) for r in results]
+        proceeds = sum(abs(float(r.get("totalCost") or 0)) for r in results)
+        self.cash += proceeds
+        self.spent = max(0.0, self.spent - cost_per_set * min(sold))
+        self.exits += 1
+        self._positions_at = 0.0  # re-read holdings next cycle
+        log.info("LIVE EXIT %s → sold %s", desc, sold)
+        log_legs("exit", results)
+        if max(sold) - min(sold) >= 1:
+            # Legs that sold more now hold less NO than the rest: buy that back to stay hedged,
+            # paying at most what we sold it for plus repair_slippage.
+            legs = [{"exchange_id": l.exchange_id, "title": l.title, "short": got - min(sold),
+                     "cap": round(min(0.995, px + self.cfg.repair_slippage), 3)}
+                    for l, px, got in zip(b.legs, order.limits, sold) if got - min(sold) >= 1]
+            repair = {"side": "no", "legs": legs, "source": "exit"}
+            log.warning("exit %s sold unevenly %s: repair %s", b.key, sold, legs)
+            self.db.save_repair(b.key, repair)
+            self.repairs[b.key] = repair
+            self.work_repair(b.key)
         return True
 
     def _settle_leg(self, r: dict) -> float:
@@ -279,7 +386,7 @@ class ArbBot:
                 "race": b.key, "legs": "".join(l.label for l in b.legs), "title": b.legs[0].title,
                 "sum_bid": sum(bids) if all(x is not None for x in bids) else None,
                 "sum_ask": sum(asks) if all(x is not None for x in asks) else None,
-                "frozen": b.key in self.repairs,
+                "frozen": b.key in self.repairs, "held": self.held.get(b.key, 0),
             })
         opps.sort(key=lambda o: -(o["sum_bid"] or 0))
         self.db.set_status({
@@ -288,8 +395,23 @@ class ArbBot:
             "max_capital": self.cfg.max_capital, "min_profit": self.cfg.min_profit,
             "poll_seconds": self.cfg.poll_seconds, "allow_yes": self.cfg.allow_yes,
             "frozen": sorted(self.repairs), "stale_skips": self.stale_skips, "last_error": self.last_error,
+            "exits": self.exits, "exit_enabled": self.cfg.exit_enabled,
+            "held": self._held_status(),
             "kill_switch": self.s.kill_switch.exists(), "opportunities": opps[:25],
         })
+
+    def _held_status(self) -> List[Dict[str, Any]]:
+        out = []
+        for b in self.baskets:
+            n = self.held.get(b.key)
+            if not n:
+                continue
+            asks = [self._quotes.get(l.exchange_id, (None, None))[1] for l in b.legs]
+            cost = self.held_cost.get(b.key)
+            out.append({"race": b.key, "title": b.legs[0].title, "sets": n, "cost_per_set": cost,
+                        "locked": n * (b.payout("no") - cost) if cost is not None else None,
+                        "sum_ask": sum(asks) if all(a is not None for a in asks) else None})
+        return out
 
     # ---- main loop ----
 

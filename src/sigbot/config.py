@@ -30,6 +30,7 @@ class ArbConfig:
     max_sets: int = 2000  # per order
     max_capital: float = 50_000.0  # total cost of baskets bought per session
     allow_yes: bool = False  # YES baskets assume one listed party wins: not riskless
+    exit_enabled: bool = True  # sell held NO baskets when that beats holding to settlement
     poll_seconds: float = 4.0
     basket_cooldown: float = 10.0  # let the book refresh after trading a basket
     order_ttl: int = 15  # seconds: a new basket that can't execute this fast should expire
@@ -86,6 +87,7 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         max_sets=int(_f("ARB_MAX_SETS", a.max_sets)),
         max_capital=_f("ARB_MAX_CAPITAL", a.max_capital),
         allow_yes=os.environ.get("ARB_YES_BASKETS", "").strip().lower() in ("1", "true", "yes"),
+        exit_enabled=os.environ.get("ARB_EXIT", "true").strip().lower() in ("1", "true", "yes"),
         poll_seconds=_f("ARB_POLL_SECONDS", a.poll_seconds),
         repair_slippage=_f("ARB_REPAIR_SLIPPAGE", a.repair_slippage),
         max_book_age=_f("ARB_MAX_BOOK_AGE", a.max_book_age),

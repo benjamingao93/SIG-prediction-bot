@@ -97,6 +97,7 @@ def live_bot(monkeypatch, tmp_path, fills, books=None, fills_api=None):
     bot.db = DB(tmp_path / "t.db")
     bot.live, bot.cfg, bot.tid = True, ArbConfig(), "t"
     bot.cash, bot.spent, bot.repairs, bot.stale_skips = 1e6, 0.0, {}, 0
+    bot.held, bot.held_cost, bot.exits, bot._positions_at = {}, {}, 0, time.monotonic()
     b = arb.build_baskets([market("1", "Democratic"), market("2", "Republican")])[0]
     # planned: 100 sets at .38 + .61 = .99 → +.01 per set
     return bot, fake, arb.ArbOrder(b, "no", 100, (.38, .61), 99.0)
@@ -184,3 +185,79 @@ def test_step_reads_best_edge_first_and_stops_at_the_budget(monkeypatch, tmp_pat
     bot.step()
     assert read == ["e3", "e4"]  # Ohio (Σbid 1.05) before Texas (1.02); then the budget is spent
     assert set(bot._last_trade) == {"S-OH"}  # Texas wasn't read, so it isn't cooling down
+
+
+# ---- exits ----
+
+def two_leg_basket():
+    return arb.build_baskets([market("1", "Democratic"), market("2", "Republican")])[0]
+
+
+def test_held_baskets_need_even_no_on_every_leg():
+    b = two_leg_basket()
+    ohio = arb.build_baskets([market("3", "Democratic", "Ohio Senate"), market("4", "Republican", "Ohio Senate")])[0]
+    held = arb.held_baskets([b, ohio], {"e1": 100, "e2": 100, "e3": 50, "e4": 20})
+    assert held == {"S-TX": 100}  # Ohio is uneven: not a basket
+    assert arb.held_baskets([b], {"e1": 100}) == {}  # one leg only
+
+
+def test_screen_exit_needs_asks_below_one_minus_min_profit():
+    b = two_leg_basket()
+    assert arb.screen_exit(b, {"e1": (.6, .61), "e2": (.38, .385)}, .005) is None  # Σask .995
+    assert arb.screen_exit(b, {"e1": (.6, .61), "e2": (.37, .38)}, .005) == pytest.approx(.01)
+    assert arb.screen_exit(b, {"e1": (.6, None), "e2": (.37, .38)}, .005) is None
+
+
+def test_size_exit_walks_asks_and_caps_at_held_sets():
+    b = two_leg_basket()
+    # selling NO = 1 − YES ask: e1 .40 (100) then .395; e2 .61 (300) then .60
+    books = {"e1": book("e1", asks=[(.60, 100), (.605, 500)]), "e2": book("e2", asks=[(.39, 300), (.40, 50)])}
+    o = arb.size_exit(b, books, held_sets=10_000, min_profit=.005, max_sets=10_000)
+    # 1-100: .40+.61=1.01 → +.01; 101-300: .395+.61=1.005 → not > .005: stop
+    assert o.sets == 100 and o.limits == (pytest.approx(.40), pytest.approx(.61))
+    assert o.proceeds == pytest.approx(101) and o.gain == pytest.approx(1)
+    assert arb.size_exit(b, books, held_sets=40, min_profit=.005, max_sets=10_000).sets == 40
+
+
+def test_live_exit_sends_sell_legs(monkeypatch, tmp_path):
+    bot, fake, _ = live_bot(monkeypatch, tmp_path, [[100, 100]])
+    bot.held, bot.held_cost, bot.spent = {"S-TX": 100}, {"S-TX": .99}, 99.0
+    order = arb.ExitOrder(two_leg_basket(), 100, (.40, .61), 101.0)
+    assert bot.execute_exit(order)
+    assert [l["action"] for l in fake.calls[0]] == ["sell", "sell"]
+    assert [l["side"] for l in fake.calls[0]] == ["no", "no"]
+    assert bot.spent == pytest.approx(0) and bot.exits == 1
+    assert bot.db.get_repairs() == {}
+
+
+def test_uneven_exit_buys_back_the_oversold_leg(monkeypatch, tmp_path):
+    # e1 sold 100, e2 only 30: e1 now holds 70 less NO than e2 → buy 70 NO back on e1
+    books = {"e1": book("e1", bids=[(.59, 1000)])}  # NO at .41 ≤ cap .40 + .02
+    bot, fake, _ = live_bot(monkeypatch, tmp_path, [[100, 30], [70]], books)
+    bot.held_cost = {"S-TX": .99}
+    bot.execute_exit(arb.ExitOrder(two_leg_basket(), 100, (.40, .61), 101.0))
+    assert fake.calls[1] == [{"exchangeId": "e1", "side": "no", "quantity": 70, "price": pytest.approx(.41)}]
+    assert bot.db.get_repairs() == {}
+
+
+def test_paper_exit_sends_nothing(monkeypatch, tmp_path):
+    bot, fake, _ = live_bot(monkeypatch, tmp_path, [])
+    bot.live = False
+    assert bot.execute_exit(arb.ExitOrder(two_leg_basket(), 100, (.40, .61), 101.0))
+    assert fake.calls == [] and bot.exits == 1
+
+
+def test_step_exits_held_basket_and_kill_switch_blocks_it(monkeypatch, tmp_path):
+    quotes = [{"exchangeId": "e1", "bestBid": .59, "bestAsk": .60}, {"exchangeId": "e2", "bestBid": .38, "bestAsk": .39}]
+    books = {"e1": book("e1", asks=[(.60, 1000)]), "e2": book("e2", asks=[(.39, 1000)])}
+    bot, fake, _ = live_bot(monkeypatch, tmp_path, [[50, 50]], books)
+    monkeypatch.setattr(arb_bot.mk, "bulk_prices", lambda c, ids, tid: quotes)
+    bot.baskets = [two_leg_basket()]
+    bot.held, bot.held_cost = {"S-TX": 50}, {"S-TX": .99}
+    bot._last_refresh, bot._last_trade, bot._quotes = time.monotonic(), {}, {}
+    (tmp_path / "KILL").touch()
+    bot.step()
+    assert fake.calls == []
+    (tmp_path / "KILL").unlink()
+    bot.step()
+    assert fake.calls[0][0]["action"] == "sell" and fake.calls[0][0]["quantity"] == 50

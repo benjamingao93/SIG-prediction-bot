@@ -41,7 +41,14 @@ until it is hedged. For a gap made any other way: `sigbot hedge "Alaska Senate" 
 races and pending repairs, the races closest to triggering, the bot's orders, and your fills and
 positions from the exchange.
 
+Exits (`ARB_EXIT`, on by default): a NO basket you hold pays `k−1` per set at settlement, and
+selling it pays `Σ(1 − ask)` now. When the YES asks across the race sum below `1 − ARB_MIN_PROFIT`,
+selling beats holding, so the bot sells: the extra profit is riskless and the capital comes back.
+Holdings come from the exchange's positions, and only races held evenly on every leg count, so
+your own manual trades are never touched.
+
 YES baskets (asks summing below 1) are off by default: they lose if an unlisted candidate wins.
+Exits capture the same mispricing without that risk, because they only close NO you already hold.
 
 ```bash
 sigbot arb            # paper: logs the baskets it would buy
