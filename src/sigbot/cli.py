@@ -6,6 +6,7 @@
   sigbot fundamentals          fundamentals model vs market price, biggest gaps first
   sigbot kalshi [--rediscover] map races to Kalshi and store a snapshot of its prices
   sigbot edges [--refresh]     where SIG disagrees with Kalshi + forecaster ratings (no trading)
+  sigbot convergence           how fast those gaps close, from the edge history the bot records
   sigbot collect [--realtime]  stage 1: record prices/books, no trading
   sigbot feed                  realtime book feed, listen-only: logs what the arb bot would do
   sigbot arb                   arbitrage: paper (logs baskets it would buy, sends nothing)
@@ -127,6 +128,13 @@ def cmd_edges(s: Settings, a) -> None:
     rows = compute_edges(s, c, db)
     db.set_edges([e.as_row() for e in rows])
     print(report(rows, a.top, a.all, kalshi_age_minutes(db)))
+
+
+def cmd_convergence(s: Settings, a) -> None:
+    from .convergence import episodes, summary
+    rows = [dict(r) for r in DB(s.db_path).query(
+        "SELECT * FROM edges_history WHERE ts >= datetime('now', ?) ORDER BY ts", (f"-{a.days} days",))]
+    print(summary(episodes(rows)))
 
 
 def cmd_collect(s: Settings, a) -> None:
@@ -279,6 +287,8 @@ def main(argv=None) -> None:
     e = sub.add_parser("edges"); e.add_argument("--refresh", action="store_true", help="fetch Kalshi first")
     e.add_argument("--top", type=int, default=30); e.add_argument("--all", action="store_true")
     e.set_defaults(fn=cmd_edges)
+    cv = sub.add_parser("convergence"); cv.add_argument("--days", type=float, default=7)
+    cv.set_defaults(fn=cmd_convergence)
     c = sub.add_parser("collect"); c.add_argument("--realtime", action="store_true")
     c.add_argument("--cycles", type=int); c.set_defaults(fn=cmd_collect)
     fd = sub.add_parser("feed"); fd.add_argument("--read-budget", type=int, default=15,

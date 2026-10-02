@@ -69,6 +69,10 @@ class DirectionalConfig:
     offices: Tuple[str, ...] = ("senate", "governor")
     budget: float = 20_000.0  # total cost of directional positions
     max_race: float = 2_000.0  # cost per race
+    track: bool = True  # the arb bot keeps fair values and an edge history (needs `sigbot kalshi` once)
+    kalshi_refresh: float = 300.0  # seconds between Kalshi refreshes (its own API, not SIG's budget)
+    kalshi_max_age: float = 900.0  # ignore Kalshi quotes older than this
+    history_every: float = 600.0  # seconds between edge-history rows
 
 
 @dataclass(frozen=True)
@@ -150,6 +154,10 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         offices=tuple(o.strip() for o in os.environ.get("DIR_OFFICES", ",".join(dd.offices)).split(",") if o.strip()),
         budget=_f("DIR_BUDGET", dd.budget),
         max_race=_f("DIR_MAX_RACE", dd.max_race),
+        track=os.environ.get("DIR_TRACK", "true").strip().lower() in ("1", "true", "yes"),
+        kalshi_refresh=_f("DIR_KALSHI_REFRESH", dd.kalshi_refresh),
+        kalshi_max_age=_f("DIR_KALSHI_MAX_AGE", dd.kalshi_max_age),
+        history_every=_f("DIR_HISTORY_EVERY", dd.history_every),
     )
     return Settings(
         api_key=api_key,

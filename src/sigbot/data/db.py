@@ -42,6 +42,11 @@ CREATE TABLE IF NOT EXISTS kalshi_quotes (
     open_interest REAL, volume_24h REAL, tickers TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_kalshi_race_ts ON kalshi_quotes(race, ts);
+CREATE TABLE IF NOT EXISTS edges_history (
+    ts TEXT, race TEXT, view TEXT, price REAL, fair REAL, edge REAL, required REAL,
+    agree INTEGER, sig_p_d REAL, kalshi_p_d REAL, rating_p_d REAL
+);
+CREATE INDEX IF NOT EXISTS ix_edges_history ON edges_history(race, view, ts);
 CREATE TABLE IF NOT EXISTS edges_snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, data TEXT
 );
@@ -183,6 +188,14 @@ class DB:
         for r in rows:
             out.setdefault(r["race"], {})[r["party"]] = dict(r)
         return out
+
+    def insert_edges_history(self, rows: Iterable[Dict[str, Any]]) -> None:
+        ts = now_iso()
+        self.conn.executemany(
+            "INSERT INTO edges_history VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [(ts, r["race"], r["view"], r["price"], r["fair"], r["edge"], r["required"], int(bool(r["agree"])),
+              r.get("sig_p_d"), r.get("kalshi_p_d"), r.get("rating_p_d")) for r in rows])
+        self.conn.commit()
 
     def set_edges(self, data: Any) -> None:
         self.conn.execute("INSERT OR REPLACE INTO edges_snapshot VALUES (1, ?, ?)", (now_iso(), json.dumps(data)))

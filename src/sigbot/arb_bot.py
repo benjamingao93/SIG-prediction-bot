@@ -60,7 +60,7 @@ class ArbBot:
         self.spent = 0.0
         self.repairs: Dict[str, Dict[str, Any]] = {}
         self._last_trade: Dict[str, float] = {}
-        self._last_refresh = 0.0
+        self._last_refresh = -1e9  # "long ago": time.monotonic() starts near 0 at process start on macOS
         self._quotes: Dict[str, tuple] = {}
         self.cycles = 0
         self.trades = 0
@@ -68,7 +68,7 @@ class ArbBot:
         self.exits = 0
         self.held: Dict[str, int] = {}  # race → NO sets held evenly on every leg
         self.held_cost: Dict[str, float] = {}  # race → cost per set
-        self._positions_at = 0.0
+        self._positions_at = -1e9
         self.last_error: Optional[str] = None
         self.started = time.time()
         self.feed = None
@@ -86,6 +86,14 @@ class ArbBot:
         if self.cfg.quoting and not self.cfg.exit_only:
             from .quoter import Quoter
             self.quoter = Quoter(self)
+        # Fair values (Kalshi + ratings) and an edge history, when `sigbot races` and `sigbot kalshi`
+        # have been run. Kalshi is fetched on its own thread and its own API, not SIG's budget.
+        self.fair = None
+        self._history_at = -1e9
+        self._edges: List[Any] = []
+        from .fairvalue_service import FairValueService
+        if s.dir.track and FairValueService.available(s):
+            self.fair = FairValueService(s)
 
     # ---- setup ----
 
@@ -200,6 +208,15 @@ class ArbBot:
                            if self.feed.usable(ex)})
             self._update_watch(quotes)
         self._quotes = quotes
+        if self.fair is not None:
+            self._edges = self.fair.edges(self.baskets, quotes)
+            # Only with a fresh Kalshi snapshot, so ratings-only rows don't skew `sigbot convergence`.
+            if (self._edges and self.fair.fresh()
+                    and time.monotonic() - self._history_at >= self.s.dir.history_every):
+                self._history_at = time.monotonic()
+                rows = [e.as_row() for e in self._edges]
+                self.db.insert_edges_history(rows)
+                self.db.set_edges(rows)
         traded = 0
         if self.cfg.exit_enabled:
             traded += self._exits(quotes)
@@ -315,7 +332,7 @@ class ArbBot:
         cost = sum(float(r.get("totalCost") or 0) for r in results)
         self.spent += cost
         self.cash -= cost
-        self._positions_at = 0.0  # re-read holdings next cycle
+        self._positions_at = -1e9  # re-read holdings next cycle
         log.info("LIVE ARB %s → filled %s", desc, filled)
         self._log(order, "sent", results)
         if max(filled) - min(filled) >= 1:
@@ -357,7 +374,7 @@ class ArbBot:
         self.cash += proceeds
         self.spent = max(0.0, self.spent - cost_per_set * min(sold))
         self.exits += 1
-        self._positions_at = 0.0  # re-read holdings next cycle
+        self._positions_at = -1e9  # re-read holdings next cycle
         log.info("LIVE EXIT %s → sold %s", desc, sold)
         log_legs("exit", results)
         if max(sold) - min(sold) >= 1:
@@ -514,6 +531,8 @@ class ArbBot:
             call_patiently(self.client, self.quoter.startup, "clearing leftover quotes")
         if self.feed is not None:
             self.feed.start_in_thread()
+        if self.fair is not None:
+            self.fair.start()
         self._starting = False
         try:
             self._loop(max_cycles)
@@ -523,6 +542,8 @@ class ArbBot:
                 self.quoter.cancel_all("bot stopping")
             if self.feed is not None:
                 self.feed.stop()
+            if self.fair is not None:
+                self.fair.stop()
 
     def _alive_loop(self) -> None:
         """Every 10 s, independent of the trading loop: proof of life for the dashboard. On a slow

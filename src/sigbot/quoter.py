@@ -46,8 +46,8 @@ class Quoter:
         self.closing: List[Dict[str, Any]] = []  # cancelled live quotes whose last fills we still owe a check
         self.stats: Dict[str, float] = {"placed": 0, "cancelled": 0, "fills": 0, "filled_sets": 0, "paper_pnl": 0.0}
         self._writes = 0
-        self._last_select = 0.0
-        self._last_poll = 0.0
+        self._last_select = -1e9
+        self._last_poll = -1e9
         self._poll_due = False
 
     # ---- helpers ----

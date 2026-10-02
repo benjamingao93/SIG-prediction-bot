@@ -100,6 +100,7 @@ def live_bot(monkeypatch, tmp_path, fills, books=None, fills_api=None):
     bot.held, bot.held_cost, bot.exits, bot._positions_at = {}, {}, 0, time.monotonic()
     bot.quoter = None
     bot.feed, bot.feed_hits, bot.feed_misses = None, 0, 0
+    bot.fair, bot._edges, bot._history_at = None, [], 0.0
     b = arb.build_baskets([market("1", "Democratic"), market("2", "Republican")])[0]
     # planned: 100 sets at .38 + .61 = .99 → +.01 per set
     return bot, fake, arb.ArbOrder(b, "no", 100, (.38, .61), 99.0)
