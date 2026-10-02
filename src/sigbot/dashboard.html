@@ -161,7 +161,7 @@ function render(d) {
   const pill = $("pill");
   if (!S) { pill.className = "pill down"; pill.textContent = "Never run"; }
   else if (!S.running) { pill.className = "pill down"; pill.textContent = "Stopped"; }
-  else { pill.className = `pill ${S.mode}`; pill.textContent = S.mode === "live" ? "Live" : "Paper"; }
+  else { pill.className = `pill ${S.mode}`; pill.textContent = (S.mode === "live" ? "Live" : "Paper") + (S.exit_only ? " · exit only" : ""); }
   const slow = S?.running && S.cycle_running != null && S.cycle_running > 30;
   $("updated").textContent = !S ? "" : S.starting && S.running ? "starting up (loading markets)" :
     slow ? `cycle running ${dur(S.cycle_running)} (exchange slow)` : `last cycle ${dur(S.age)} ago`;

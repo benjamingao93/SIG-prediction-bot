@@ -31,6 +31,7 @@ class ArbConfig:
     max_capital: float = 50_000.0  # most that may sit in baskets at once (cost basis)
     allow_yes: bool = False  # YES baskets assume one listed party wins: not riskless
     exit_enabled: bool = True  # sell held NO baskets when that beats holding to settlement
+    exit_only: bool = False  # `--exit-only`: sell and repair, buy nothing new (frees capital)
     exit_early: bool = True  # ...or as soon as selling locks in exit_min_profit over cost
     exit_min_profit: float = 0.0025  # per set, over cost: low, so capital comes back early
     poll_seconds: float = 4.0
@@ -104,6 +105,7 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         allow_yes=os.environ.get("ARB_YES_BASKETS", "").strip().lower() in ("1", "true", "yes"),
         exit_enabled=os.environ.get("ARB_EXIT", "true").strip().lower() in ("1", "true", "yes"),
         exit_early=os.environ.get("ARB_EXIT_EARLY", "true").strip().lower() in ("1", "true", "yes"),
+        exit_only=os.environ.get("ARB_EXIT_ONLY", "").strip().lower() in ("1", "true", "yes"),
         exit_min_profit=_f("ARB_EXIT_MIN_PROFIT", a.exit_min_profit),
         poll_seconds=_f("ARB_POLL_SECONDS", a.poll_seconds),
         repair_slippage=_f("ARB_REPAIR_SLIPPAGE", a.repair_slippage),

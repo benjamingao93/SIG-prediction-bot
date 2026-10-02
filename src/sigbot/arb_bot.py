@@ -83,7 +83,7 @@ class ArbBot:
             self.feed = FeedRunner(client, self.tid, reserve=10)
             self.feed.on_fills = self._wake.set
         self.quoter = None
-        if self.cfg.quoting:
+        if self.cfg.quoting and not self.cfg.exit_only:
             from .quoter import Quoter
             self.quoter = Quoter(self)
 
@@ -203,6 +203,8 @@ class ArbBot:
         traded = 0
         if self.cfg.exit_enabled:
             traded += self._exits(quotes)
+        if self.cfg.exit_only:
+            return traded  # exits and repairs only: no new baskets, no quotes
         if self.quoter:
             self.quoter.step(quotes, {str(r["exchangeId"]): r.get("latestPrice") for r in rows})
         flagged = []
@@ -473,7 +475,7 @@ class ArbBot:
             "max_capital": self.cfg.max_capital, "min_profit": self.cfg.min_profit,
             "poll_seconds": self.cfg.poll_seconds, "allow_yes": self.cfg.allow_yes,
             "frozen": sorted(self.repairs), "stale_skips": self.stale_skips, "last_error": self.last_error,
-            "exits": self.exits, "exit_enabled": self.cfg.exit_enabled,
+            "exits": self.exits, "exit_enabled": self.cfg.exit_enabled, "exit_only": self.cfg.exit_only,
             "quoting": self.quoter.status(self._quotes) if self.quoter else None,
             "feed": None if self.feed is None else {
                 "healthy": self.feed.healthy, "watching": len(self.feed.market_ids),
