@@ -19,21 +19,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import re
+import threading
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .client import SigAPIError, SigClient
 from .models import OrderBook
 
 log = logging.getLogger(__name__)
 TOKEN_REFRESH_SECONDS = 2.5 * 3600  # tokens live 3h
-STALL_SECONDS = 90.0  # no batch from any market this long: the socket is dead, rebuild it
 JOIN_BATCH = 20  # channels joined at a time: 237 at once timed out, one at a time took minutes
 JOIN_WAIT = 12.0  # seconds to wait for a batch's join replies (the library times out at 10)
-JOIN_RETRIES = 2
+JOIN_RETRY_AFTER = 30.0  # seconds before retrying a market that wouldn't join
+VERIFY_LAG = 5.0  # seconds of engine time a feed book may trail REST before it's reloaded
 
 Version = Tuple[int, float]  # (engine sequence, engine time as epoch seconds)
 
@@ -93,6 +95,11 @@ class BookStore:
     def quotes(self) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
         return {ex: (b.best_bid, b.best_ask) for ex, b in self.books.items()}
 
+    def drop_market(self, market_id: str) -> None:
+        for ex in [ex for ex, m in self.market_of.items() if m == market_id]:
+            for d in (self.books, self.versions, self.market_of, self.expiry):
+                d.pop(ex, None)
+
     def expired_markets(self, now: Optional[float] = None) -> Set[str]:
         """Markets with a book past its nextExpiryAt: its resting orders have expired silently."""
         now = now or time.time()
@@ -141,20 +148,94 @@ class MarketFeed:
 
 
 class FeedRunner:
-    """Subscribes to every market, keeps the BookStore current, and calls on_change(exchange_ids)
-    after each update. REST reloads use the client's read budget and leave `reserve` reads free."""
+    """Keeps the BookStore current for a watchlist of markets and calls on_change(exchange_ids)
+    after each update. The watchlist can change while running (set_watch); markets are joined and
+    left to match it. usable(exchange_id) says whether a book can be trusted right now: an
+    unchanged book is still current as long as its market is subscribed with nothing missed.
+    REST reloads use the client's read budget and leave `reserve` reads free.
 
-    def __init__(self, client: SigClient, tournament_id: str, market_ids: Iterable[str],
-                 on_change: Callable[[Set[str]], None] = lambda exs: None, reserve: int = 3):
+    Health: the client library's own reconnect can die silently (seen live: a keepalive timeout,
+    then "rejoining" nothing), so the runner watches the socket itself and, every verify_every
+    seconds, reads one watched book over REST: a feed copy more than VERIFY_LAG seconds of engine
+    time behind gets reloaded, and two in a row rebuild the connection."""
+
+    def __init__(self, client: SigClient, tournament_id: str, market_ids: Iterable[str] = (),
+                 on_change: Callable[[Set[str]], None] = lambda exs: None, reserve: int = 3,
+                 verify_every: float = 60.0):
         self.client = client
         self.tid = tournament_id
-        self.market_ids = list(market_ids)
         self.store = BookStore()
         self.feed = MarketFeed(self.store)
         self.on_change = on_change
         self.reserve = reserve
+        self.verify_every = verify_every
+        self._desired: Set[str] = set(market_ids)
+        self.joined: Dict[str, Any] = {}  # market → channel on the current connection
         self.subscribed: Set[str] = set()
-        self.last_batch = time.monotonic()
+        self.healthy = False
+        self._join_after: Dict[str, float] = {}  # market → monotonic time to retry a failed join
+        self._behind = 0
+        # Your account channel (user:{profile_id}): fills pushed within ~1 s. Pushed fills carry
+        # no id, so they are a signal to read the fills list, not something to count directly.
+        self.user_subscribed = False
+        self.user_need_poll = True  # set on (re)join, gap, resync and token refresh
+        self._user_rev: Optional[int] = None
+        self._fills: deque = deque()
+        self.on_fills: Callable[[], None] = lambda: None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ---- watchlist and trust ----
+
+    @property
+    def market_ids(self) -> List[str]:
+        return sorted(self._desired)
+
+    def set_watch(self, market_ids: Iterable[str]) -> None:
+        self._desired = set(market_ids)  # one assignment: safe to call from the bot's thread
+
+    def usable(self, exchange_id: str, now: Optional[float] = None) -> bool:
+        if not self.healthy:
+            return False
+        m = self.store.market_of.get(exchange_id)
+        if m is None or m not in self.subscribed or m in self.feed.need_resync:
+            return False
+        if self.store.versions.get(exchange_id) is None:
+            return False
+        exp = self.store.expiry.get(exchange_id)
+        return exp is None or exp > (now or time.time())
+
+    def user_trusted(self) -> bool:
+        """Pushed fills can be relied on: nothing missed since the last fills-list read."""
+        return self.healthy and self.user_subscribed and not self.user_need_poll
+
+    def pop_fills(self) -> List[Dict[str, Any]]:
+        out = []
+        while self._fills:
+            out.append(self._fills.popleft())
+        return out
+
+    def _on_account(self, msg: Dict[str, Any]) -> None:
+        p = msg.get("payload", msg) if isinstance(msg, dict) else {}
+        d = p.get("delivery") or {}
+        rev, prev = d.get("revision"), d.get("previousRevision")
+        last = self._user_rev
+        if p.get("resyncRequired"):
+            self.user_need_poll = True
+        elif last is not None and rev is not None and rev <= last:
+            return  # duplicate
+        elif last is not None and prev is not None and prev > last:
+            self.feed.stats["user_gaps"] += 1
+            self.user_need_poll = True
+        if rev is not None and (last is None or rev > last):
+            self._user_rev = rev
+        fills = [f for f in p.get("fills") or [] if isinstance(f, dict)]
+        if fills:
+            self.feed.stats["pushed_fills"] += len(fills)
+            self._fills.extend(fills)
+            self.on_fills()
+
+    # ---- REST ----
 
     def resync(self, market_id: str) -> Set[str]:
         """Authoritative reload of one market's books over REST (one read)."""
@@ -166,8 +247,31 @@ class FeedRunner:
         self.feed.stats["resyncs"] += 1
         return changed
 
+    def _verify_one(self) -> Optional[bool]:
+        """Compare one usable watched book with REST. True: feed behind. None: nothing checked."""
+        exs = [ex for ex in list(self.store.versions) if self.usable(ex)]
+        if not exs or self.client.reads.available <= self.reserve:
+            return None
+        ex = random.choice(exs)
+        raw = self.client.get(f"/exchanges/{ex}/orderbook", tournamentId=self.tid, depth=1)
+        rest_v, feed_v = _version(raw.get("asOf")), self.store.versions.get(ex)
+        self.feed.stats["verifies"] += 1
+        if rest_v is None or feed_v is None:
+            return None
+        behind = rest_v[0] > feed_v[0] and rest_v[1] - feed_v[1] > VERIFY_LAG
+        if behind:
+            self.feed.stats["verify_behind"] += 1
+            m = self.store.market_of.get(ex)
+            if m:
+                self.feed.need_resync.add(m)
+            log.warning("feed book for %s is %.0fs behind REST: reloading", ex, rest_v[1] - feed_v[1])
+        return behind
+
+    # ---- callbacks (on the feed's event loop) ----
+
     def _on_batch(self, market_id: str, msg: Dict[str, Any]) -> None:
-        self.last_batch = time.monotonic()
+        if market_id not in self.joined:
+            return  # a market we've just left
         try:
             changed = self.feed.handle(market_id, msg)
             if changed:
@@ -186,13 +290,18 @@ class FeedRunner:
             if err:
                 log.warning("market %s channel %s: %s", market_id, name, err)
 
+    # ---- connection work ----
+
     async def _mint(self) -> Dict[str, Any]:
         return await asyncio.to_thread(self.client.post, "/realtime/token")
 
     async def _work_resyncs(self) -> None:
         self.feed.need_resync |= self.store.expired_markets()
-        while self.feed.need_resync and self.client.reads.available > self.reserve:
-            mid = self.feed.need_resync.pop()
+        pending = [m for m in self.feed.need_resync if m in self.subscribed]
+        for mid in pending:
+            if self.client.reads.available <= self.reserve:
+                return
+            self.feed.need_resync.discard(mid)
             try:
                 changed = await asyncio.to_thread(self.resync, mid)
             except SigAPIError as e:
@@ -202,35 +311,57 @@ class FeedRunner:
             if changed:
                 self.on_change(changed)
 
-    async def _join_all(self, sb) -> None:
-        """Join every market's channel in batches, waiting for each batch's replies, then retry
-        the ones that didn't join on fresh channels (a channel can only subscribe once)."""
-        channels: Dict[str, Any] = {}
-        todo = list(self.market_ids)
-        for attempt in range(1 + JOIN_RETRIES):
-            for i in range(0, len(todo), JOIN_BATCH):
-                batch = todo[i:i + JOIN_BATCH]
-                for mid in batch:
-                    old = channels.pop(mid, None)
-                    if old is not None:
-                        try:
-                            await sb.remove_channel(old)
-                        except Exception:
-                            pass
-                    ch = sb.channel(f"tournament:{self.tid}:market:{mid}", {"config": {"private": True}})
-                    ch.on_broadcast("market_batch", lambda m, mid=mid: self._on_batch(mid, m))
-                    channels[mid] = ch
-                await asyncio.gather(*(channels[mid].subscribe(lambda st, err=None, mid=mid: self._on_state(mid, st, err))
-                                       for mid in batch))
-                deadline = time.monotonic() + JOIN_WAIT
-                while time.monotonic() < deadline and any(mid not in self.subscribed for mid in batch):
-                    await asyncio.sleep(0.1)
-            todo = [mid for mid in self.market_ids if mid not in self.subscribed]
-            if not todo:
-                return
-            self.feed.stats["join_retries"] += len(todo)
-            log.warning("realtime: %d markets didn't join; retrying (%d/%d)", len(todo), attempt + 1, JOIN_RETRIES)
-        log.error("realtime: %d markets never joined: %s", len(todo), todo[:10])
+    async def _leave(self, sb, mid: str) -> None:
+        ch = self.joined.pop(mid, None)
+        self.subscribed.discard(mid)
+        self.feed.last_rev.pop(mid, None)
+        self.feed.need_resync.discard(mid)
+        self.store.drop_market(mid)
+        if ch is not None:
+            try:
+                await sb.remove_channel(ch)
+            except Exception:
+                pass
+
+    async def _join(self, sb, mids: List[str]) -> None:
+        """Join in batches, waiting for each batch's replies (237 at once timed out; one at a
+        time took minutes). A market that won't join is retried after JOIN_RETRY_AFTER."""
+        for i in range(0, len(mids), JOIN_BATCH):
+            batch = mids[i:i + JOIN_BATCH]
+            for mid in batch:
+                ch = sb.channel(f"tournament:{self.tid}:market:{mid}", {"config": {"private": True}})
+                ch.on_broadcast("market_batch", lambda m, mid=mid: self._on_batch(mid, m))
+                self.joined[mid] = ch
+            await asyncio.gather(*(self.joined[mid].subscribe(lambda st, err=None, mid=mid: self._on_state(mid, st, err))
+                                   for mid in batch))
+            deadline = time.monotonic() + JOIN_WAIT
+            while time.monotonic() < deadline and any(mid not in self.subscribed for mid in batch):
+                await asyncio.sleep(0.1)
+            for mid in batch:
+                if mid in self.subscribed:
+                    self.feed.need_resync.add(mid)  # initial state comes from REST
+                else:
+                    self.feed.stats["join_failures"] += 1
+                    self._join_after[mid] = time.monotonic() + JOIN_RETRY_AFTER
+                    await self._leave(sb, mid)
+
+    async def _reconcile(self, sb) -> None:
+        desired = self._desired
+        for mid in [m for m in self.joined if m not in desired]:
+            await self._leave(sb, mid)
+        now = time.monotonic()
+        new = sorted(m for m in desired if m not in self.joined and self._join_after.get(m, 0) <= now)
+        if new:
+            await self._join(sb, new)
+
+    def _reset(self) -> None:
+        self.healthy = False
+        self.user_subscribed = False
+        self.user_need_poll = True
+        self._user_rev = None
+        self.joined.clear()
+        self.subscribed.clear()
+        self.feed.last_rev.clear()
 
     async def run(self) -> None:
         try:
@@ -238,45 +369,82 @@ class FeedRunner:
         except ImportError as e:
             raise SystemExit("Realtime needs: pip install -e '.[realtime]'") from e
         backoff = 1.0
-        while True:
+        while not self._stop.is_set():
             sb = None
             try:
                 tok = await self._mint()
                 sb = await acreate_client(tok["supabaseUrl"], tok["anonKey"])
                 await sb.realtime.set_auth(tok["token"])
-                await self._join_all(sb)
-                self.feed.need_resync |= set(self.market_ids)  # initial state comes from REST
-                log.info("realtime: subscribed to %d/%d markets", len(self.subscribed), len(self.market_ids))
+                self._reset()
+                user_topic = (tok.get("channels") or {}).get("user")
+                if user_topic:
+                    uch = sb.channel(user_topic, {"config": {"private": True}})
+                    uch.on_broadcast("account_batch", self._on_account)
+                    await uch.subscribe(lambda st, err=None: setattr(
+                        self, "user_subscribed", str(st).rsplit(".", 1)[-1] == "SUBSCRIBED"))
+                await self._reconcile(sb)
+                # The library reconnects on its own after a keepalive timeout but rejoins nothing
+                # (seen live), leaving channels we think are live on a socket that isn't theirs.
+                # Remember this socket: if it's ever replaced, rebuild everything ourselves.
+                socket = getattr(sb.realtime, "_ws_connection", None)
+                self.healthy = True
+                log.info("realtime: subscribed to %d/%d markets", len(self.subscribed), len(self._desired))
                 backoff = 1.0
-                self.last_batch = time.monotonic()
                 refresh_at = time.monotonic() + TOKEN_REFRESH_SECONDS
-                while True:
-                    # The library's own reconnect can die silently (seen live: a keepalive
-                    # timeout, then rejoining nothing), so watch the socket and the traffic.
+                verify_at = time.monotonic() + self.verify_every
+                while not self._stop.is_set():
                     if not sb.realtime.is_connected:
                         raise ConnectionError("socket closed")
-                    if time.monotonic() - self.last_batch > STALL_SECONDS:
-                        raise ConnectionError(f"no batch from any market for {STALL_SECONDS:.0f}s")
+                    if getattr(sb.realtime, "_ws_connection", None) is not socket:
+                        raise ConnectionError("socket replaced by the library's reconnect")
+                    await self._reconcile(sb)
                     await self._work_resyncs()
+                    if time.monotonic() >= verify_at:
+                        verify_at = time.monotonic() + self.verify_every
+                        try:
+                            behind = await asyncio.to_thread(self._verify_one)
+                        except SigAPIError as e:
+                            log.info("feed verify skipped: %s", e)
+                            behind = None
+                        if behind is not None:
+                            self._behind = self._behind + 1 if behind else 0
+                            if self._behind >= 2:
+                                self._behind = 0
+                                raise ConnectionError("feed fell behind REST twice in a row")
                     if time.monotonic() > refresh_at:
                         tok = await self._mint()
                         await sb.realtime.set_auth(tok["token"])
-                        self.feed.need_resync |= set(self.market_ids)
+                        self.feed.need_resync |= set(self.subscribed)
+                        self.user_need_poll = True
                         self.feed.stats["token_refreshes"] += 1
                         refresh_at = time.monotonic() + TOKEN_REFRESH_SECONDS
                     await asyncio.sleep(0.5)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                self._reset()
+                if self._stop.is_set():
+                    break
                 self.feed.stats["reconnects"] += 1
                 log.warning("realtime connection lost (%s): reconnecting in %.0fs", e, backoff)
-                self.subscribed.clear()
-                self.feed.last_rev.clear()
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
             finally:
+                self.healthy = False
                 if sb is not None:
                     try:
                         await sb.realtime.close()
                     except Exception:
                         pass
+
+    # ---- running next to synchronous code ----
+
+    def start_in_thread(self) -> None:
+        """Run the feed on its own event loop in a daemon thread (the arb bot is synchronous)."""
+        self._thread = threading.Thread(target=lambda: asyncio.run(self.run()), daemon=True, name="realtime-feed")
+        self._thread.start()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout)

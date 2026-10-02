@@ -99,6 +99,7 @@ def live_bot(monkeypatch, tmp_path, fills, books=None, fills_api=None):
     bot.cash, bot.spent, bot.repairs, bot.stale_skips = 1e6, 0.0, {}, 0
     bot.held, bot.held_cost, bot.exits, bot._positions_at = {}, {}, 0, time.monotonic()
     bot.quoter = None
+    bot.feed, bot.feed_hits, bot.feed_misses = None, 0, 0
     b = arb.build_baskets([market("1", "Democratic"), market("2", "Republican")])[0]
     # planned: 100 sets at .38 + .61 = .99 → +.01 per set
     return bot, fake, arb.ArbOrder(b, "no", 100, (.38, .61), 99.0)
@@ -290,3 +291,54 @@ def test_step_exits_held_basket_and_kill_switch_blocks_it(monkeypatch, tmp_path)
     (tmp_path / "KILL").unlink()
     bot.step()
     assert fake.calls[0][0]["action"] == "sell" and fake.calls[0][0]["quantity"] == 50
+
+
+# ---- realtime feed in the bot ----
+
+def test_books_come_from_the_feed_when_trusted_else_rest(monkeypatch, tmp_path):
+    from sigbot.api.realtime import FeedRunner
+    rest_reads = []
+    bot, _, _ = live_bot(monkeypatch, tmp_path, [], books={"e1": book("e1", bids=[(.5, 10)]), "e2": book("e2")})
+    monkeypatch.setattr(arb_bot.mk, "get_orderbook", lambda c, ex, tid: rest_reads.append(ex) or book(ex))
+    bot.feed = FeedRunner(SimpleNamespace(reads=SimpleNamespace(available=100)), "t")
+    for ex, mid in (("e1", "1"), ("e2", "2")):
+        bot.feed.store.apply(mid, {"exchangeId": ex, "asOf": {"sequence": 1, "at": None},
+                                   "bids": [{"price": .61, "quantity": 5}], "asks": []})
+    bot.feed.healthy, bot.feed.subscribed = True, {"1", "2"}
+    books, read_at = bot._books(["e1", "e2"])
+    assert rest_reads == [] and books["e1"].best_bid == .61 and bot.feed_hits == 1
+    assert not bot._stale(read_at, "x")  # current as of now: never skipped as stale
+    bot.feed.subscribed = {"1"}  # e2's market dropped: fall back to REST for the race
+    bot._books(["e1", "e2"])
+    assert sorted(rest_reads) == ["e1", "e2"] and bot.feed_misses == 1
+
+
+def test_watchlist_puts_held_and_repairing_races_first_and_caps_markets(monkeypatch, tmp_path):
+    from sigbot.api.realtime import FeedRunner
+    bot, _, _ = live_bot(monkeypatch, tmp_path, [])
+    races = ["Texas Senate", "Ohio Senate", "Iowa Senate", "Maine Senate"]
+    ms = [market(f"{i}{p[0]}", p, r) for i, r in enumerate(races) for p in ("Democratic", "Republican")]
+    bot.baskets = arb.build_baskets(ms)
+    bot.feed = FeedRunner(SimpleNamespace(reads=SimpleNamespace(available=100)), "t")
+    bot.cfg = ArbConfig(feed_markets=4)
+    bot.held, bot.repairs = {"S-ME": 10}, {"S-IA": {}}
+    quotes = {f"e{i}{p}": (.49, .5) for i in range(4) for p in "DR"}
+    quotes.update({"e1D": (.52, .53)})  # Ohio closest to a buy trigger
+    bot._update_watch(quotes)
+    assert set(bot.feed.market_ids) == {"2D", "2R", "3D", "3R"}  # held + repairing fill the 4 slots
+    bot.cfg = ArbConfig(feed_markets=6)
+    bot._update_watch(quotes)
+    assert {"1D", "1R"} <= set(bot.feed.market_ids)  # then the race nearest a trigger
+
+
+def test_bot_wakes_for_pushed_fills_before_the_next_cycle(monkeypatch, tmp_path):
+    import threading
+    bot, _, _ = live_bot(monkeypatch, tmp_path, [])
+    handled = []
+    bot._wake, bot._quotes = threading.Event(), {}
+    bot.quoter = SimpleNamespace(process_pushed=lambda quotes: handled.append(time.monotonic()))
+    t0 = time.monotonic()
+    threading.Timer(0.05, bot._wake.set).start()
+    bot._wait_until(t0 + 0.5)
+    assert handled and handled[0] - t0 < 0.3  # handled at the push, then waited out the cycle
+    assert time.monotonic() - t0 >= 0.5

@@ -105,7 +105,7 @@ def make(monkeypatch, tmp_path, live, hedge_depth=500, **cfg):
     bot = SimpleNamespace(
         live=live, cfg=ArbConfig(quoting=True, **cfg), baskets=[TX], db=DB(tmp_path / "t.db"), repairs={},
         cash=1e6, tid="t", s=SimpleNamespace(kill_switch=Path(tmp_path / "KILL"), tournament_slug="x"),
-        client=SimpleNamespace(get=lambda path, **kw: fills), worked=[])
+        client=SimpleNamespace(get=lambda path, **kw: fills), worked=[], feed=None)
     bot._can_read = lambda n: True
     bot._books = lambda exs: ({ex: books[ex] for ex in exs}, time.monotonic())
     bot.work_repair = lambda race: bot.worked.append(race)
@@ -192,3 +192,73 @@ def test_add_to_repair_merges(tmp_path):
     db.add_to_repair("S-TX", "no", [{"exchange_id": "e2", "title": "R", "short": 100, "cap": .60}], "quote")
     rep = db.add_to_repair("S-TX", "no", [{"exchange_id": "e2", "title": "R", "short": 100, "cap": .64}], "quote")
     assert rep["legs"][0]["short"] == 200 and rep["legs"][0]["cap"] == pytest.approx(.62)
+
+
+# ---- account-channel fills and confirmed cancels ----
+
+from sigbot.api.client import SigAPIError
+
+
+class FakeFeed:
+    def __init__(self, trusted=True):
+        self.trusted, self.pushed, self.user_need_poll = trusted, [], False
+
+    def user_trusted(self):
+        return self.trusted
+
+    def pop_fills(self):
+        out, self.pushed = self.pushed, []
+        return out
+
+
+def counting(bot, fills):
+    calls = []
+    bot.client = SimpleNamespace(get=lambda path, **kw: calls.append(path) or fills)
+    return calls
+
+
+def test_trusted_channel_skips_routine_fill_reads_until_one_of_ours_is_pushed(monkeypatch, tmp_path):
+    q, bot, fake, fills, _ = make(monkeypatch, tmp_path, live=True)
+    bot.feed = FakeFeed(trusted=True)
+    q.step(Q, {})  # places the quote
+    calls = counting(bot, fills)
+    q._last_poll = time.monotonic()
+    q.step(Q, {})
+    assert calls == []  # nothing pushed, safety read not due yet
+    bot.feed.pushed = [{"orderId": 999, "quantity": -5}]  # someone else's fill
+    q.step(Q, {})
+    assert calls == []
+    fills["data"] = [{"orderId": 101, "quantity": -60}]
+    bot.feed.pushed = [{"orderId": 101, "quantity": -60}]
+    q.process_pushed(Q)  # what the bot's wake-up calls
+    assert len(calls) == 1 and bot.db.get_repairs()["S-TX"]["legs"][0]["short"] == 60
+
+
+def test_untrusted_channel_reads_fills_every_cycle(monkeypatch, tmp_path):
+    q, bot, fake, fills, _ = make(monkeypatch, tmp_path, live=True)
+    bot.feed = FakeFeed(trusted=False)
+    q.step(Q, {})
+    calls = counting(bot, fills)
+    q._last_poll = time.monotonic()
+    q.step(Q, {})
+    q.step(Q, {})
+    assert len(calls) == 2
+
+
+def test_unconfirmed_cancel_is_retried_and_its_fills_still_hedged(monkeypatch, tmp_path):
+    q, bot, fake, fills, _ = make(monkeypatch, tmp_path, live=True)
+    q.step(Q, {})
+    attempts = []
+
+    def flaky_cancel(client, oid):
+        attempts.append(oid)
+        if len(attempts) == 1:
+            raise SigAPIError(503, "SERVICE_UNAVAILABLE", "busy")
+    monkeypatch.setattr(quoter_mod.orders, "cancel", flaky_cancel)
+    q.cancel_all("test")
+    assert "S-TX@101" in bot.db.get_quotes()  # kept for a restart until confirmed
+    fills["data"] = [{"orderId": 101, "quantity": -20}]  # it filled while still resting
+    q._detect_live(Q)
+    assert attempts == [101, 101] and q.closing == []
+    assert bot.db.get_repairs()["S-TX"]["legs"][0]["short"] == 20
+    assert "S-TX@101" not in bot.db.get_quotes()

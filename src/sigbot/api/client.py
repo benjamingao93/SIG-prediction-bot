@@ -5,12 +5,17 @@ GET/HEAD are reads; everything else is a write.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections import deque
-from typing import Any, Callable, Deque, Dict, Iterator, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Deque, Dict, Iterator, Optional, TypeVar
 
 import httpx
+
+log = logging.getLogger(__name__)
+T = TypeVar("T")
 
 # Codes the API documents as safe to retry. ORDER_STATUS_UNKNOWN is only safe because
 # order POSTs carry an idempotencyKey and we resend the identical body.
@@ -92,6 +97,17 @@ class SigClient:
         self.reads = RateLimiter(read_budget, sleep=sleep)
         self.writes = RateLimiter(write_budget, sleep=sleep)
         self.max_retries = max_retries
+        self._local = threading.local()  # per-thread timeout override (see patient())
+
+    @contextmanager
+    def patient(self, timeout: float):
+        """Longer per-request timeout for this thread only, e.g. at startup on a slow exchange."""
+        prev = getattr(self._local, "timeout", None)
+        self._local.timeout = timeout
+        try:
+            yield self
+        finally:
+            self._local.timeout = prev
 
     def close(self) -> None:
         self._http.close()
@@ -121,7 +137,9 @@ class SigClient:
         while True:
             limiter.acquire()
             try:
-                resp = self._http.request(method, path, params=params, json=json)
+                override = getattr(self._local, "timeout", None)
+                resp = self._http.request(method, path, params=params, json=json,
+                                          timeout=override if override else httpx.USE_CLIENT_DEFAULT)
             except httpx.TransportError as e:
                 if attempt >= self.max_retries:
                     raise SigAPIError(0, "TRANSPORT_ERROR", str(e)) from e
@@ -156,3 +174,24 @@ def _parse_error(resp: httpx.Response) -> SigAPIError:
         return SigAPIError(resp.status_code, e.get("code", "UNKNOWN"), e.get("message", ""), e.get("details"))
     except ValueError:
         return SigAPIError(resp.status_code, "UNKNOWN", resp.text[:200])
+
+
+# Failures that mean the exchange is slow or struggling, not that the request is wrong.
+TRANSIENT_CODES = RETRYABLE_CODES | {"TRANSPORT_ERROR", "INTERNAL_ERROR", "DATABASE_ERROR"}
+
+
+def call_patiently(client: SigClient, fn: Callable[[], T], what: str, timeout: float = 60.0,
+                   max_backoff: float = 60.0, sleep: Callable[[float], None] = time.sleep) -> T:
+    """Run fn with long request timeouts, retrying for as long as the exchange is slow or
+    erroring (seen live: startup reads taking 14-36 s). Real client errors still raise."""
+    backoff = 2.0
+    with client.patient(timeout):
+        while True:
+            try:
+                return fn()
+            except SigAPIError as e:
+                if e.code not in TRANSIENT_CODES and e.status < 500:
+                    raise
+                log.warning("%s: %s — exchange slow or failing, retrying in %.0fs", what, e, backoff)
+                sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)

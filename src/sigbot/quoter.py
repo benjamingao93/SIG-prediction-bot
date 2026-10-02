@@ -31,6 +31,11 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 RESELECT_SECONDS = 300.0
+POLL_SECONDS = 30.0  # fills-list safety read when the account channel is trusted
+
+
+def _closing_key(q: Dict[str, Any]) -> str:
+    return f"{q['race']}@{q.get('order_id')}"
 
 
 class Quoter:
@@ -42,6 +47,8 @@ class Quoter:
         self.stats: Dict[str, float] = {"placed": 0, "cancelled": 0, "fills": 0, "filled_sets": 0, "paper_pnl": 0.0}
         self._writes = 0
         self._last_select = 0.0
+        self._last_poll = 0.0
+        self._poll_due = False
 
     # ---- helpers ----
 
@@ -61,12 +68,14 @@ class Quoter:
 
     def startup(self) -> None:
         """Cancel quotes a previous run left resting, and hedge anything they filled."""
-        for race, q in self.bot.db.get_quotes().items():
+        for key, q in self.bot.db.get_quotes().items():
+            race = q["race"]
             if self.bot.live and q.get("order_id"):
-                try:
-                    orders.cancel(self.bot.client, q["order_id"])
-                except SigAPIError as e:
-                    log.info("leftover quote %s: %s", q["order_id"], e)
+                if not self._try_cancel(q):
+                    # Still possibly resting: keep retrying the cancel and watching its fills.
+                    q["cancel_ok"] = False
+                    self.closing.append(q)
+                    continue
                 try:
                     fills = self.bot.client.get(f"/orders/{q['order_id']}/fills").get("data", [])
                     got = sum(abs(float(f.get("quantity") or 0)) for f in fills)
@@ -75,7 +84,7 @@ class Quoter:
                 except SigAPIError as e:
                     log.error("couldn't check fills of leftover quote %s on %s: %s — check positions",
                               q["order_id"], race, e)
-            self.bot.db.delete_quote(race)
+            self.bot.db.delete_quote(key)
 
     def cancel_all(self, reason: str) -> None:
         for race in list(self.active):
@@ -97,9 +106,32 @@ class Quoter:
 
     # ---- 1-2: fills and hedges ----
 
+    def process_pushed(self, quotes) -> None:
+        """Called the moment the account channel pushes fills: if any are ours, read the fills
+        list and hedge now instead of at the next cycle."""
+        feed = self.bot.feed
+        if feed is None or not self.bot.live:
+            return
+        ours = {str(q.get("order_id")) for q in list(self.active.values()) + self.closing if q.get("order_id")}
+        if any(str(f.get("orderId")) in ours for f in feed.pop_fills()):
+            self._poll_due = True
+            self._detect_live(quotes)
+
     def _detect_live(self, quotes) -> None:
+        """Hedge new fills on our quotes, counted from the authoritative fills list. Read it every
+        cycle unless the account channel is trusted, then only when it pushes one of our fills,
+        while cancels are unconfirmed, or every POLL_SECONDS as a safety net."""
+        self._retry_cancels()
         watched = list(self.active.values()) + self.closing
-        if not watched or not self.bot._can_read(1):
+        feed = self.bot.feed
+        if feed is not None:
+            ours = {str(q.get("order_id")) for q in watched if q.get("order_id")}
+            if any(str(f.get("orderId")) in ours for f in feed.pop_fills()):
+                self._poll_due = True
+        trusted = feed is not None and feed.user_trusted()
+        due = (not trusted or self._poll_due or self.closing
+               or time.monotonic() - self._last_poll > POLL_SECONDS)
+        if not watched or not due or not self.bot._can_read(1):
             return
         try:
             fills = self.bot.client.get(f"/tournaments/{self.bot.s.tournament_slug}/portfolio/fills",
@@ -107,18 +139,44 @@ class Quoter:
         except SigAPIError as e:
             log.warning("quote fill check failed: %s", e)
             return
-        by_order: Dict[Any, float] = {}
+        self._last_poll, self._poll_due = time.monotonic(), False
+        if feed is not None:
+            feed.user_need_poll = False  # caught up with anything the channel may have missed
+        by_order: Dict[str, float] = {}
         for f in fills:
-            by_order[f.get("orderId")] = by_order.get(f.get("orderId"), 0.0) + abs(float(f.get("quantity") or 0))
+            k = str(f.get("orderId"))
+            by_order[k] = by_order.get(k, 0.0) + abs(float(f.get("quantity") or 0))
         for q in watched:
-            got = by_order.get(q.get("order_id"), 0.0)
+            got = by_order.get(str(q.get("order_id")), 0.0)
             if got - q["filled"] >= 1:
                 self._on_fill(q, got - q["filled"], quotes)
-        self.closing = []
+        # A cancelled quote is done once its cancel is confirmed and a fills read came after it.
+        for q in [q for q in self.closing if q.get("cancel_ok")]:
+            self.closing.remove(q)
+            self.bot.db.delete_quote(_closing_key(q))
         for race, q in list(self.active.items()):
             if q["size"] - q["filled"] < 1:  # fully filled: the order is gone
                 del self.active[race]
                 self.bot.db.delete_quote(race)
+
+    def _try_cancel(self, q: Dict[str, Any]) -> bool:
+        """True once the exchange confirms the order is no longer resting."""
+        self._writes += 1
+        try:
+            orders.cancel(self.bot.client, q["order_id"])
+            return True
+        except SigAPIError as e:
+            if e.status in (404, 409) or e.code in ("NOT_FOUND", "CONFLICT"):
+                return True  # already filled, expired or cancelled
+            log.warning("cancel of quote %s on %s not confirmed (%s): retrying next cycle",
+                        q["order_id"], q["race"], e)
+            return False
+
+    def _retry_cancels(self) -> None:
+        for q in self.closing:
+            if not q.get("cancel_ok"):
+                q["cancel_ok"] = self._try_cancel(q)
+                self.bot.db.save_quote(_closing_key(q), q)
 
     def _detect_paper(self, quotes, lasts) -> None:
         for race, q in list(self.active.items()):
@@ -161,12 +219,11 @@ class Quoter:
         if not force and not self._write_ok():
             return False
         if self.bot.live and q.get("order_id"):
-            self._writes += 1
-            try:
-                orders.cancel(self.bot.client, q["order_id"])
-            except SigAPIError as e:
-                log.info("cancel quote %s on %s: %s", q["order_id"], race, e)
-            self.closing.append(q)  # fills that landed before the cancel are picked up next check
+            # Keep watching it (and keep it on disk for a restart) until the cancel is confirmed
+            # and a fills read has come after it.
+            q["cancel_ok"] = self._try_cancel(q)
+            self.closing.append(q)
+            self.bot.db.save_quote(_closing_key(q), q)
         del self.active[race]
         self.bot.db.delete_quote(race)
         self.stats["cancelled"] += 1

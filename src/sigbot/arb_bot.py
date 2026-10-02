@@ -21,6 +21,8 @@ Live execution:
      on by default) beats what the set cost by ARB_EXIT_MIN_PROFIT (same budget, freshness and
      repair handling as buys). Holdings come from
      the exchange's positions; only races held evenly on every leg count as baskets.
+  Realtime (`--feed`): books for watched races come from the WebSocket feed instead of REST, so
+  those trades and repairs don't wait on the rate limit (api/realtime.py).
   6. Quotes (`--quote`, quoter.py): resting buy-NO orders on one leg, hedged through repairs
      when they fill.
 The kill switch blocks every order, repairs and exits included, and cancels resting quotes.
@@ -28,6 +30,7 @@ The kill switch blocks every order, repairs and exits included, and cancels rest
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .api import markets as mk
 from .api import orders
 from .api import portfolio as pf
-from .api.client import SigAPIError, SigClient
+from .api.client import SigAPIError, SigClient, call_patiently
 from .api.models import OrderBook
 from .data.db import DB
 from .config import Settings
@@ -49,7 +52,8 @@ log = logging.getLogger(__name__)
 class ArbBot:
     def __init__(self, s: Settings, client: SigClient, db: DB, live: bool):
         self.s, self.client, self.db, self.live, self.cfg = s, client, db, live, s.arb
-        self.tournament = mk.get_tournament(client, s.tournament_slug)
+        self.tournament = call_patiently(client, lambda: mk.get_tournament(client, s.tournament_slug),
+                                         "reading the tournament")
         self.tid = self.tournament["id"]
         self.cash = float(self.tournament.get("myBalance") or 0)
         self.baskets: List[Basket] = []
@@ -67,6 +71,14 @@ class ArbBot:
         self._positions_at = 0.0
         self.last_error: Optional[str] = None
         self.started = time.time()
+        self.feed = None
+        self.feed_hits = self.feed_misses = 0
+        self._wake = threading.Event()  # set by the feed thread when your account gets fills
+        if self.cfg.feed:
+            from .api.realtime import FeedRunner
+            # Shares this client, so its reloads count against the same budget; keep 10 free.
+            self.feed = FeedRunner(client, self.tid, reserve=10)
+            self.feed.on_fills = self._wake.set
         self.quoter = None
         if self.cfg.quoting:
             from .quoter import Quoter
@@ -107,9 +119,16 @@ class ArbBot:
         return self.client.reads.available >= n + 3
 
     def _books(self, exchange_ids) -> Tuple[Dict[str, OrderBook], float]:
-        """Fresh books, read in parallel so a slow exchange costs one round trip, not one per
-        leg, and the monotonic time the first of them arrived (the age that matters)."""
+        """Fresh books and the monotonic time the first of them arrived (the age that matters).
+        From the realtime feed when every leg's book there can be trusted: no reads, no wait,
+        current as of now. Otherwise read over REST, in parallel so a slow exchange costs one
+        round trip, not one per leg."""
         ids = list(exchange_ids)
+        if self.feed is not None and all(self.feed.usable(ex) for ex in ids):
+            self.feed_hits += 1
+            return {ex: self.feed.store.books[ex] for ex in ids}, time.monotonic()
+        if self.feed is not None:
+            self.feed_misses += 1
         arrived: Dict[str, float] = {}
 
         def read(ex):
@@ -120,6 +139,34 @@ class ArbBot:
         with ThreadPoolExecutor(max_workers=max(1, len(ids))) as pool:
             books = dict(zip(ids, pool.map(read, ids)))
         return books, min(arrived.values())
+
+    def _update_watch(self, quotes) -> None:
+        """The feed watches the races where stale books cost money: held, being repaired, quoted,
+        then the ones closest to a buy or exit trigger, up to feed_markets markets."""
+        by_key = {b.key: b for b in self.baskets}
+        first = set(self.held) | set(self.repairs) | (set(self.quoter.active) if self.quoter else set())
+        races = [r for r in sorted(first) if r in by_key]
+
+        def closeness(b: Basket) -> float:
+            qs = [quotes.get(l.exchange_id, (None, None)) for l in b.legs]
+            if any(q[0] is None or q[1] is None for q in qs):
+                return -1e9
+            buy = sum(q[0] for q in qs) - 1  # 0 at the buy trigger, normally a little below
+            spread = sum(q[1] - q[0] for q in qs)  # wide spreads: room for quotes
+            return max(buy, -spread / 4)
+
+        if self.quoter:
+            from .trading import quoting
+            races += [s.basket.key for s in quoting.select_quotes(self.baskets, quotes, 2 * self.cfg.quote_races,
+                                                                  self.cfg.quote_edge, exclude=races)]
+        races += [b.key for b in sorted(self.baskets, key=closeness, reverse=True) if b.key not in races]
+        markets: List[str] = []
+        for r in races:
+            ms = [l.market_id for l in by_key[r].legs]
+            if len(markets) + len(ms) > self.cfg.feed_markets:
+                break
+            markets += ms
+        self.feed.set_watch(markets)
 
     def _stale(self, read_at: float, what: str) -> bool:
         age = time.monotonic() - read_at
@@ -142,6 +189,11 @@ class ArbBot:
         ex_ids = [l.exchange_id for b in self.baskets for l in b.legs]
         rows = mk.bulk_prices(self.client, ex_ids, self.tid)
         quotes = arb.quotes_from_prices(rows)
+        if self.feed is not None:
+            # Feed prices are newer than the poll for the markets it watches.
+            quotes.update({ex: (b.best_bid, b.best_ask) for ex, b in list(self.feed.store.books.items())
+                           if self.feed.usable(ex)})
+            self._update_watch(quotes)
         self._quotes = quotes
         traded = 0
         if self.cfg.exit_enabled:
@@ -417,6 +469,11 @@ class ArbBot:
             "frozen": sorted(self.repairs), "stale_skips": self.stale_skips, "last_error": self.last_error,
             "exits": self.exits, "exit_enabled": self.cfg.exit_enabled,
             "quoting": self.quoter.status(self._quotes) if self.quoter else None,
+            "feed": None if self.feed is None else {
+                "healthy": self.feed.healthy, "watching": len(self.feed.market_ids),
+                "subscribed": len(self.feed.subscribed), "hits": self.feed_hits, "misses": self.feed_misses,
+                **{k: v for k, v in self.feed.feed.stats.items()
+                   if k in ("batches", "gaps", "resyncs", "reconnects", "verifies", "verify_behind")}},
             "held": self._held_status(),
             "kill_switch": self.s.kill_switch.exists(), "opportunities": opps[:25],
         })
@@ -439,16 +496,20 @@ class ArbBot:
     # ---- main loop ----
 
     def run(self, max_cycles: Optional[int] = None) -> None:
-        self.refresh()
-        for v in arb.violations(self.client, self.tid):
-            log.info("engine-reported violation: %s", v.get("reason"))
+        # The tournament has no engine relationships, and that read took 36 s on a slow night,
+        # so startup no longer checks `arb.violations`.
+        call_patiently(self.client, self.refresh, "loading markets")
         if self.quoter:
-            self.quoter.startup()
+            call_patiently(self.client, self.quoter.startup, "clearing leftover quotes")
+        if self.feed is not None:
+            self.feed.start_in_thread()
         try:
             self._loop(max_cycles)
         finally:
             if self.quoter:
                 self.quoter.cancel_all("bot stopping")
+            if self.feed is not None:
+                self.feed.stop()
 
     def _loop(self, max_cycles: Optional[int]) -> None:
         n = 0
@@ -468,4 +529,23 @@ class ArbBot:
                 self.write_status()
             except Exception:
                 log.exception("status write failed")
-            time.sleep(max(0.0, self.cfg.poll_seconds - (time.monotonic() - t0)))
+            self._wait_until(t0 + self.cfg.poll_seconds)
+
+    def _wait_until(self, deadline: float) -> None:
+        """Sleep until the next cycle, but wake at once when the account channel pushes fills:
+        a filled quote is hedged within about a second instead of at the next cycle."""
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not self._wake.wait(left):
+                return
+            self._wake.clear()
+            if self.quoter is None:
+                continue
+            try:
+                self.quoter.process_pushed(self._quotes)
+            except SigAPIError as e:
+                log.error("hedging pushed fills failed: %s", e)
+                self.last_error = f"{time.strftime('%H:%M:%S')} {e}"
+            except Exception as e:
+                log.exception("hedging pushed fills failed")
+                self.last_error = f"{time.strftime('%H:%M:%S')} {type(e).__name__}: {e}"

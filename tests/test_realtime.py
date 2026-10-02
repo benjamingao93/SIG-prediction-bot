@@ -72,3 +72,111 @@ def test_resync_required_and_unsequenced_trades_force_a_reload():
     assert "a" in f.need_resync and f.last_rev["a"] == 5
     f.handle("b", batch(3, 2, trades=[{"sequence": None}]))
     assert "b" in f.need_resync
+
+
+# ---- FeedRunner: watchlist, trust, verification ----
+
+import asyncio
+from types import SimpleNamespace
+
+from sigbot.api.realtime import FeedRunner
+
+
+class FakeChannel:
+    def __init__(self, topic, joins):
+        self.topic, self.joins = topic, joins
+
+    def on_broadcast(self, event, cb):
+        self.cb = cb
+
+    async def subscribe(self, cb):
+        cb("RealtimeSubscribeStates.SUBSCRIBED" if self.joins else "RealtimeSubscribeStates.TIMED_OUT")
+
+
+class FakeSocket:
+    def __init__(self, failing=()):
+        self.failing, self.removed = set(failing), []
+
+    def channel(self, topic, params):
+        return FakeChannel(topic, topic.rsplit(":", 1)[-1] not in self.failing)
+
+    async def remove_channel(self, ch):
+        self.removed.append(ch.topic)
+
+
+def runner(**kw):
+    client = SimpleNamespace(reads=SimpleNamespace(available=100), get=kw.pop("get", None))
+    return FeedRunner(client, "t", **kw)
+
+
+def test_usable_needs_health_subscription_no_pending_reload_and_no_expiry():
+    r = runner()
+    r.store.apply("m", raw(1, 5, expiry="2099-01-01T00:00:00+00:00"))
+    assert not r.usable("1")  # not healthy yet
+    r.healthy, r.subscribed = True, {"m"}
+    assert r.usable("1")
+    r.feed.need_resync.add("m")
+    assert not r.usable("1")
+    r.feed.need_resync.clear()
+    r.store.expiry["1"] = time.time() - 1  # a resting order expired silently
+    assert not r.usable("1")
+
+
+def test_reconcile_joins_new_markets_leaves_old_and_backs_off_failures(monkeypatch):
+    monkeypatch.setattr("sigbot.api.realtime.JOIN_WAIT", 0.05)
+    r, sb = runner(market_ids=["a", "b", "x"]), FakeSocket(failing={"x"})
+    asyncio.run(r._reconcile(sb))
+    assert r.subscribed == {"a", "b"} and set(r.joined) == {"a", "b"}
+    assert r.feed.need_resync == {"a", "b"}  # initial books come from REST
+    assert "x" in r._join_after  # retried later, not every loop
+    r.store.apply("a", raw(1, 5))
+    r.set_watch(["b", "c"])
+    asyncio.run(r._reconcile(sb))
+    assert set(r.joined) == {"b", "c"} and "a" not in r.subscribed
+    assert "1" not in r.store.books  # a left market's books are dropped
+    assert any(t.endswith(":a") for t in sb.removed)
+
+
+def test_verify_reloads_a_lagging_book():
+    lagging = {"asOf": {"sequence": 9, "at": "2026-10-02T03:26:00+00:00"}}
+    r = runner(get=lambda path, **kw: lagging)
+    r.store.apply("m", raw(1, 5, at="2026-10-02T03:25:48+00:00"))
+    r.healthy, r.subscribed = True, {"m"}
+    assert r._verify_one() is True and "m" in r.feed.need_resync  # 12 s behind
+    r.feed.need_resync.clear()
+    r.store.apply("m", raw(1, 9, at="2026-10-02T03:26:00+00:00"))
+    assert r._verify_one() is False
+
+
+def test_account_channel_signals_fills_and_flags_gaps():
+    r = runner()
+    woke = []
+    r.on_fills = lambda: woke.append(1)
+    r.healthy, r.user_subscribed, r.user_need_poll = True, True, False
+
+    def acct(rev, prev, fills=(), **extra):
+        return {"payload": {"delivery": {"revision": rev, "previousRevision": prev}, "fills": list(fills), **extra}}
+    r._on_account(acct(5, 4, [{"orderId": 1}]))
+    assert r.pop_fills() == [{"orderId": 1}] and woke == [1] and r.user_trusted()
+    r._on_account(acct(5, 4, [{"orderId": 1}]))  # duplicate batch
+    assert r.pop_fills() == [] and woke == [1]
+    r._on_account(acct(9, 7))  # 6-7 missed
+    assert not r.user_trusted() and r.user_need_poll
+
+
+def test_call_patiently_retries_slow_exchange_but_not_bad_requests():
+    from sigbot.api.client import SigAPIError, call_patiently
+    seen, slept = [], []
+    client = SimpleNamespace(patient=lambda t: __import__("contextlib").nullcontext())
+
+    def flaky():
+        seen.append(1)
+        if len(seen) < 3:
+            raise SigAPIError(0, "TRANSPORT_ERROR", "timed out")
+        return "ok"
+    assert call_patiently(client, flaky, "x", sleep=slept.append) == "ok" and slept == [2.0, 4.0]
+
+    def bad():
+        raise SigAPIError(400, "VALIDATION_ERROR", "nope")
+    with pytest.raises(SigAPIError):
+        call_patiently(client, bad, "x", sleep=slept.append)

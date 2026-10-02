@@ -9,6 +9,7 @@
   sigbot arb                   arbitrage: paper (logs baskets it would buy, sends nothing)
   sigbot arb --live            arbitrage with real orders (also requires MODE=live in .env)
   sigbot arb --quote           also rest passive quotes (paper: simulated fills; add --live for real)
+  sigbot arb --feed            realtime books for the races that matter, so trades don't wait on reads
   sigbot hedge RACE --max-price P   have the arb bot finish hedging an uneven race (NO side)
   sigbot dashboard             local dashboard at http://localhost:8050 (read-only)
   sigbot run                   model strategy, paper trading (logs signals, sends nothing)
@@ -148,6 +149,8 @@ def cmd_arb(s: Settings, a) -> None:
     live = a.live
     if a.quote:  # one more read per cycle for fills: slow the poll a little
         s = replace(s, arb=replace(s.arb, quoting=True, poll_seconds=max(s.arb.poll_seconds, 5.0)))
+    if a.feed:
+        s = replace(s, arb=replace(s.arb, feed=True))
     if live and s.mode != "live":
         raise SystemExit("--live also requires MODE=live in .env. Refusing to send orders.")
     _require_slug(s)
@@ -256,6 +259,7 @@ def main(argv=None) -> None:
     r.add_argument("--cycles", type=int); r.set_defaults(fn=cmd_run)
     ar = sub.add_parser("arb"); ar.add_argument("--live", action="store_true")
     ar.add_argument("--quote", action="store_true", help="rest passive quotes (paper unless --live)")
+    ar.add_argument("--feed", action="store_true", help="realtime books for watched races (needs .[realtime])")
     ar.add_argument("--cycles", type=int); ar.set_defaults(fn=cmd_arb)
     h = sub.add_parser("hedge"); h.add_argument("race"); h.add_argument("--max-price", type=float)
     h.add_argument("--cancel", action="store_true"); h.set_defaults(fn=cmd_hedge)

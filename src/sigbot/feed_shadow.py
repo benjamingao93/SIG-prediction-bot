@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Set
 
 from .api import markets as mk
 from .api import portfolio as pf
-from .api.client import SigAPIError, SigClient
+from .api.client import SigAPIError, SigClient, call_patiently
 from .api.realtime import FeedRunner, _version
 from .config import Settings
 from .trading import arb
@@ -29,9 +29,10 @@ log = logging.getLogger(__name__)
 class Shadow:
     def __init__(self, s: Settings, client: SigClient):
         self.s, self.client, self.cfg = s, client, s.arb
-        t = mk.get_tournament(client, s.tournament_slug)
+        t = call_patiently(client, lambda: mk.get_tournament(client, s.tournament_slug), "reading the tournament")
         self.tid = t["id"]
-        ms = mk.list_tournament_markets(client, s.tournament_slug, status="open")
+        ms = call_patiently(client, lambda: mk.list_tournament_markets(client, s.tournament_slug, status="open"),
+                            "loading markets")
         self.baskets = arb.build_baskets(ms)
         self.by_exchange: Dict[str, List[arb.Basket]] = {}
         for b in self.baskets:

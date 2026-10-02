@@ -61,7 +61,20 @@ are optimistic.
 ```bash
 sigbot arb --quote           # paper: logs quotes and simulated fills/profit
 sigbot arb --live --quote    # real resting orders
+sigbot arb --live --feed     # realtime books for the races that matter (combine with --quote)
 ```
+
+Realtime feed (`--feed`, off by default, needs `pip install -e '.[realtime]'`): the bot keeps up to
+`ARB_FEED_MARKETS` (40) markets on the WebSocket feed: races it holds, is repairing or quoting first,
+then the ones nearest a trigger. Books for those races come from the feed, current as of now, so
+their trades and repairs never wait on the rate limit or get skipped as stale; anything the feed
+can't vouch for (disconnected, a missed update, an expired order) falls back to REST. Once a minute
+it checks one feed book against REST and reloads or reconnects if it lags. It also listens on your
+account channel: a pushed fill on one of the bot's quotes wakes the bot to read the fills list and
+hedge within about a second, and while that channel is healthy the fills list is only re-read
+every 30 s.
+
+On a slow exchange, startup reads retry with long timeouts instead of giving up.
 
 YES baskets (asks summing below 1) are off by default: they lose if an unlisted candidate wins.
 Exits capture the same mispricing without that risk, because they only close NO you already hold.
