@@ -68,8 +68,11 @@ Realtime feed (`--feed`, off by default, needs `pip install -e '.[realtime]'`): 
 `ARB_FEED_MARKETS` (40) markets on the WebSocket feed: races it holds, is repairing or quoting first,
 then the ones nearest a trigger. Books for those races come from the feed, current as of now, so
 their trades and repairs never wait on the rate limit or get skipped as stale; anything the feed
-can't vouch for (disconnected, a missed update, an expired order) falls back to REST. Once a minute
-it checks one feed book against REST and reloads or reconnects if it lags. It also listens on your
+can't vouch for (disconnected, a missed update, an expired order) falls back to REST. The exchange
+sends each update once and may drop the last one on a quiet market without a later gap to show it,
+so, as the docs require, every watched market is also reloaded over REST every 90 s and its books
+are only trusted within 150 s of the last reload. Once a minute it also checks one feed book against
+REST and reloads or reconnects if it lags. It also listens on your
 account channel: a pushed fill on one of the bot's quotes wakes the bot to read the fills list and
 hedge within about a second, and while that channel is healthy the fills list is only re-read
 every 30 s.

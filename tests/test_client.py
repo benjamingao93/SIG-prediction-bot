@@ -69,3 +69,15 @@ def test_rate_limiter_blocks_when_full():
     rl.acquire(); rl.acquire()
     rl.acquire()  # must wait ~60s
     assert slept and slept[0] == pytest.approx(60.01)
+
+
+def test_request_in_flight_waits_out_the_90_second_lease():
+    calls = []
+    def h(req):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(409, json={"error": {"code": "REQUEST_IN_FLIGHT", "message": "busy"}})
+        return httpx.Response(200, json={"orderId": 1})
+    c, sleeps = make(h)
+    assert c.post("/orders", {"idempotencyKey": "k"}) == {"orderId": 1}
+    assert sleeps == [90.0]

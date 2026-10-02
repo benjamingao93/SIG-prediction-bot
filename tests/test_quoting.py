@@ -262,3 +262,17 @@ def test_unconfirmed_cancel_is_retried_and_its_fills_still_hedged(monkeypatch, t
     assert attempts == [101, 101] and q.closing == []
     assert bot.db.get_repairs()["S-TX"]["legs"][0]["short"] == 20
     assert "S-TX@101" not in bot.db.get_quotes()
+
+
+
+def test_no_requote_on_a_race_until_its_cancel_is_confirmed(monkeypatch, tmp_path):
+    q, bot, fake, fills, _ = make(monkeypatch, tmp_path, live=True)
+    q.step(Q, {})
+
+    def refuse(client, oid):
+        raise SigAPIError(503, "SERVICE_UNAVAILABLE", "busy")
+    monkeypatch.setattr(quoter_mod.orders, "cancel", refuse)
+    q.cancel_all("test")
+    q._writes = 0
+    q._fill_slots(Q, {})
+    assert len(fake.placed) == 1  # S-TX not quoted again while the old order may still rest

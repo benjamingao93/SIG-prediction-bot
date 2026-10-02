@@ -76,6 +76,7 @@ class ArbBot:
         self._wake = threading.Event()  # set by the feed thread when your account gets fills
         self._cycle_started: Optional[float] = None  # wall time the current cycle began
         self._alive_stop = threading.Event()
+        self._starting = False
         if self.cfg.feed:
             from .api.realtime import FeedRunner
             # Shares this client, so its reloads count against the same budget; keep 10 free.
@@ -501,6 +502,9 @@ class ArbBot:
     # ---- main loop ----
 
     def run(self, max_cycles: Optional[int] = None) -> None:
+        # Proof of life first: on a slow exchange the startup reads below take minutes.
+        self._starting = True
+        threading.Thread(target=self._alive_loop, daemon=True, name="alive").start()
         # The tournament has no engine relationships, and that read took 36 s on a slow night,
         # so startup no longer checks `arb.violations`.
         call_patiently(self.client, self.refresh, "loading markets")
@@ -508,7 +512,7 @@ class ArbBot:
             call_patiently(self.client, self.quoter.startup, "clearing leftover quotes")
         if self.feed is not None:
             self.feed.start_in_thread()
-        threading.Thread(target=self._alive_loop, daemon=True, name="alive").start()
+        self._starting = False
         try:
             self._loop(max_cycles)
         finally:
@@ -524,7 +528,8 @@ class ArbBot:
         db = DB(self.s.db_path)  # own connection: this runs on another thread
         while not self._alive_stop.is_set():
             try:
-                db.set_alive(self._cycle_started, self.cycles, "live" if self.live else "paper")
+                db.set_alive(self._cycle_started, self.cycles, "live" if self.live else "paper",
+                             starting=self._starting)
             except Exception:
                 log.debug("alive write failed", exc_info=True)
             self._alive_stop.wait(10)

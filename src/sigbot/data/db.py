@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS arb_repairs (
     race TEXT PRIMARY KEY, data TEXT, created TEXT, updated TEXT
 );
 CREATE TABLE IF NOT EXISTS bot_alive (
-    id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, cycle_started REAL, cycle INTEGER, mode TEXT
+    id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, cycle_started REAL, cycle INTEGER, mode TEXT,
+    starting INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS bot_status (
     id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, status TEXT
@@ -66,6 +67,9 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(bot_alive)")}
+        if "starting" not in cols:  # databases created before the column existed
+            self.conn.execute("ALTER TABLE bot_alive ADD COLUMN starting INTEGER DEFAULT 0")
 
     def upsert_markets(self, markets: Iterable[Market]) -> None:
         ts = now_iso()
@@ -166,11 +170,11 @@ class DB:
         self.conn.execute("DELETE FROM arb_quotes WHERE race=?", (race,))
         self.conn.commit()
 
-    def set_alive(self, cycle_started: Optional[float], cycle: int, mode: str) -> None:
+    def set_alive(self, cycle_started: Optional[float], cycle: int, mode: str, starting: bool = False) -> None:
         """Written every few seconds from a separate thread, so the dashboard can tell a bot stuck
-        in a slow cycle from a stopped one."""
-        self.conn.execute("INSERT OR REPLACE INTO bot_alive VALUES (1, ?, ?, ?, ?)",
-                          (now_iso(), cycle_started, cycle, mode))
+        in a slow cycle (or a slow startup) from a stopped one."""
+        self.conn.execute("INSERT OR REPLACE INTO bot_alive (id, ts, cycle_started, cycle, mode, starting) "
+                          "VALUES (1, ?, ?, ?, ?, ?)", (now_iso(), cycle_started, cycle, mode, int(starting)))
         self.conn.commit()
 
     def get_alive(self) -> Optional[Dict[str, Any]]:

@@ -25,3 +25,14 @@ def test_no_alive_signal_for_a_while_means_stopped(tmp_path):
     db.conn.execute("UPDATE bot_alive SET ts = '2000-01-01T00:00:00+00:00'")
     db.conn.commit()
     assert local_state(db, s)["status"]["running"] is False
+
+
+def test_a_starting_bot_shows_as_live(tmp_path):
+    db = DB(tmp_path / "t.db")
+    s = SimpleNamespace(kill_switch=tmp_path / "KILL")
+    db.set_status({"mode": "live", "poll_seconds": 4})
+    db.conn.execute("UPDATE bot_status SET ts = '2000-01-01T00:00:00+00:00'")  # previous run's status
+    db.conn.commit()
+    db.set_alive(None, 0, "live", starting=True)
+    st = local_state(db, s)["status"]
+    assert st["running"] is True and st["starting"] is True

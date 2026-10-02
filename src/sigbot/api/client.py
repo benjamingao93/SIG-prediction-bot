@@ -28,6 +28,9 @@ RETRYABLE_CODES = {
 }
 
 
+REQUEST_IN_FLIGHT_LEASE = 90.0  # seconds
+
+
 class SigAPIError(Exception):
     def __init__(self, status: int, code: str, message: str, details: Any = None):
         super().__init__(f"{status} {code}: {message}")
@@ -154,6 +157,9 @@ class SigClient:
             if err.code in RETRYABLE_CODES and attempt < self.max_retries:
                 retry_after = resp.headers.get("Retry-After")
                 wait = float(retry_after) if retry_after else _backoff(attempt)
+                if err.code == "REQUEST_IN_FLIGHT":
+                    # Another request with this idempotency key holds a 90 s lease (docs).
+                    wait = max(wait, REQUEST_IN_FLIGHT_LEASE)
                 self._sleep(wait)
                 attempt += 1
                 continue

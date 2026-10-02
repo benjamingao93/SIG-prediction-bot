@@ -305,6 +305,7 @@ def test_books_come_from_the_feed_when_trusted_else_rest(monkeypatch, tmp_path):
         bot.feed.store.apply(mid, {"exchangeId": ex, "asOf": {"sequence": 1, "at": None},
                                    "bids": [{"price": .61, "quantity": 5}], "asks": []})
     bot.feed.healthy, bot.feed.subscribed = True, {"1", "2"}
+    bot.feed.synced_at = {"1": time.monotonic(), "2": time.monotonic()}
     books, read_at = bot._books(["e1", "e2"])
     assert rest_reads == [] and books["e1"].best_bid == .61 and bot.feed_hits == 1
     assert not bot._stale(read_at, "x")  # current as of now: never skipped as stale

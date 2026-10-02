@@ -114,6 +114,7 @@ def test_usable_needs_health_subscription_no_pending_reload_and_no_expiry():
     r.store.apply("m", raw(1, 5, expiry="2099-01-01T00:00:00+00:00"))
     assert not r.usable("1")  # not healthy yet
     r.healthy, r.subscribed = True, {"m"}
+    r.synced_at["m"] = time.monotonic()
     assert r.usable("1")
     r.feed.need_resync.add("m")
     assert not r.usable("1")
@@ -142,6 +143,7 @@ def test_verify_reloads_a_lagging_book():
     r = runner(get=lambda path, **kw: lagging)
     r.store.apply("m", raw(1, 5, at="2026-10-02T03:25:48+00:00"))
     r.healthy, r.subscribed = True, {"m"}
+    r.synced_at["m"] = time.monotonic()
     assert r._verify_one() is True and "m" in r.feed.need_resync  # 12 s behind
     r.feed.need_resync.clear()
     r.store.apply("m", raw(1, 9, at="2026-10-02T03:26:00+00:00"))
@@ -186,8 +188,34 @@ def test_standalone_book_dirty_marks_the_book_untrusted_until_reloaded():
     r = runner()
     r.store.apply("m", raw(1, 5))
     r.healthy, r.subscribed, r.joined = True, {"m"}, {"m": object()}
+    r.synced_at["m"] = time.monotonic()
     assert r.usable("1")
     r._on_dirty("m", "book_dirty")  # sent outside a market_batch, with no book
     assert not r.usable("1") and "m" in r.feed.need_resync
     r._on_dirty("gone", "book_dirty")  # a market we've left: ignored
     assert "gone" not in r.feed.need_resync
+
+
+
+def test_quiet_market_is_untrusted_once_its_periodic_reload_is_overdue(monkeypatch):
+    import sigbot.api.realtime as rt
+    r = runner()
+    r.store.apply("m", raw(1, 5))
+    r.healthy, r.subscribed = True, {"m"}
+    r.synced_at["m"] = time.monotonic()
+    assert r.usable("1")
+    r.synced_at["m"] = time.monotonic() - rt.TRUST_FOR - 1  # its last batch may have been dropped
+    assert not r.usable("1")
+
+
+def test_periodic_reloads_are_queued_oldest_first(monkeypatch):
+    import sigbot.api.realtime as rt
+    reloaded = []
+    r = runner()
+    r.client.reads.available = 100
+    r.resync = lambda m: reloaded.append(m) or set()
+    r.subscribed = {"fresh", "old", "older"}
+    now = time.monotonic()
+    r.synced_at = {"fresh": now, "old": now - rt.RESYNC_EVERY - 5, "older": now - rt.RESYNC_EVERY - 50}
+    asyncio.run(r._work_resyncs())
+    assert reloaded == ["older", "old"]

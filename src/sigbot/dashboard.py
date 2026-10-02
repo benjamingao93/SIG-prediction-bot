@@ -139,6 +139,9 @@ def local_state(db: DB, s: Settings) -> Dict[str, Any]:
             status["running"] = alive_age < 30
             started = alive.get("cycle_started")
             status["cycle_running"] = round(now.timestamp() - started) if started else None
+            status["starting"] = bool(alive.get("starting"))
+            if status["starting"]:
+                status["mode"] = alive.get("mode") or status.get("mode")
     orders: Dict[tuple, Dict[str, Any]] = {}
     for r in db.query("SELECT * FROM signals ORDER BY ts DESC LIMIT 400"):
         try:

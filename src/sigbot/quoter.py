@@ -248,7 +248,9 @@ class Quoter:
     # ---- 4: placement ----
 
     def _fill_slots(self, quotes, lasts) -> None:
-        exclude = set(self.active) | set(self.bot.repairs)
+        # The docs: re-post only once the cancel is confirmed, so no targeted order is still resting.
+        unconfirmed = {q["race"] for q in self.closing if not q.get("cancel_ok")}
+        exclude = set(self.active) | set(self.bot.repairs) | unconfirmed
         if time.monotonic() - self._last_select > RESELECT_SECONDS:
             self._last_select = time.monotonic()
             keep = {s.basket.key for s in quoting.select_quotes(self.bot.baskets, quotes, 2 * self.cfg.quote_races,

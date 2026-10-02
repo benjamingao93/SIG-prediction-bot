@@ -32,10 +32,19 @@ from .models import OrderBook
 
 log = logging.getLogger(__name__)
 TOKEN_REFRESH_SECONDS = 2.5 * 3600  # tokens live 3h
-JOIN_BATCH = 20  # channels joined at a time: 237 at once timed out, one at a time took minutes
-JOIN_WAIT = 12.0  # seconds to wait for a batch's join replies (the library times out at 10)
+# Joins are slow on the server: 3.5-6 s each (measured, public and private channels alike), and a
+# batch queues behind itself. The library's default 10 s join timeout failed most of a batch of 20.
+JOIN_TIMEOUT = 60  # seconds the library waits for a join reply (its default is 10)
+JOIN_BATCH = 10  # channels joined at a time: a batch fits inside JOIN_TIMEOUT at ~5 s per join
+JOIN_WAIT = JOIN_TIMEOUT + 5.0  # seconds we wait for a batch's join replies
 JOIN_RETRY_AFTER = 30.0  # seconds before retrying a market that wouldn't join
 VERIFY_LAG = 5.0  # seconds of engine time a feed book may trail REST before it's reloaded
+# Each batch is sent once and never retried, so the last batch on a quiet market can be dropped with
+# no later gap to reveal it. The docs say to refetch periodically (every one to two minutes): each
+# watched market is reloaded over REST every RESYNC_EVERY, and its books are trusted only while
+# the last reload is under TRUST_FOR old.
+RESYNC_EVERY = 90.0
+TRUST_FOR = 150.0
 
 Version = Tuple[int, float]  # (engine sequence, engine time as epoch seconds)
 
@@ -174,6 +183,7 @@ class FeedRunner:
         self.subscribed: Set[str] = set()
         self.healthy = False
         self._join_after: Dict[str, float] = {}  # market → monotonic time to retry a failed join
+        self.synced_at: Dict[str, float] = {}  # market → monotonic time of its last REST reload
         self._behind = 0
         # Your account channel (user:{profile_id}): fills pushed within ~1 s. Pushed fills carry
         # no id, so they are a signal to read the fills list, not something to count directly.
@@ -200,6 +210,8 @@ class FeedRunner:
         m = self.store.market_of.get(exchange_id)
         if m is None or m not in self.subscribed or m in self.feed.need_resync:
             return False
+        if time.monotonic() - self.synced_at.get(m, -1e9) > TRUST_FOR:
+            return False  # overdue for its periodic reload: a dropped batch could be hiding
         if self.store.versions.get(exchange_id) is None:
             return False
         exp = self.store.expiry.get(exchange_id)
@@ -244,6 +256,7 @@ class FeedRunner:
         for b in resp.get("exchanges", []):
             if self.store.apply(market_id, b, authoritative=True):
                 changed.add(str(b["exchangeId"]))
+        self.synced_at[market_id] = time.monotonic()
         self.feed.stats["resyncs"] += 1
         return changed
 
@@ -303,6 +316,14 @@ class FeedRunner:
     async def _work_resyncs(self) -> None:
         self.feed.need_resync |= self.store.expired_markets()
         pending = [m for m in self.feed.need_resync if m in self.subscribed]
+        # Periodic reconciliation, oldest first, after anything known to be stale.
+        now = time.monotonic()
+        due = sorted((m for m in self.subscribed if m not in self.feed.need_resync
+                      and now - self.synced_at.get(m, -1e9) > RESYNC_EVERY),
+                     key=lambda m: self.synced_at.get(m, -1e9))
+        for m in due:
+            self.feed.need_resync.add(m)
+        pending += due
         for mid in pending:
             if self.client.reads.available <= self.reserve:
                 return
@@ -321,6 +342,7 @@ class FeedRunner:
         self.subscribed.discard(mid)
         self.feed.last_rev.pop(mid, None)
         self.feed.need_resync.discard(mid)
+        self.synced_at.pop(mid, None)
         self.store.drop_market(mid)
         if ch is not None:
             try:
@@ -384,6 +406,11 @@ class FeedRunner:
                 tok = await self._mint()
                 sb = await acreate_client(tok["supabaseUrl"], tok["anonKey"])
                 await sb.realtime.set_auth(tok["token"])
+                # Connect once, explicitly. Each subscribe connects on its own if the socket isn't
+                # up yet, so a batch of concurrent subscribes opened one socket each; only one was
+                # read, the other joins "timed out", and the orphans died of keepalive timeouts.
+                await sb.realtime.connect()
+                sb.realtime.timeout = JOIN_TIMEOUT  # channels copy this when created
                 self._reset()
                 user_topic = (tok.get("channels") or {}).get("user")
                 if user_topic:

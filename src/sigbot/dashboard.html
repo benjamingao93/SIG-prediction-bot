@@ -163,8 +163,8 @@ function render(d) {
   else if (!S.running) { pill.className = "pill down"; pill.textContent = "Stopped"; }
   else { pill.className = `pill ${S.mode}`; pill.textContent = S.mode === "live" ? "Live" : "Paper"; }
   const slow = S?.running && S.cycle_running != null && S.cycle_running > 30;
-  $("updated").textContent = !S ? "" : slow ? `cycle running ${dur(S.cycle_running)} (exchange slow)` :
-    `last cycle ${dur(S.age)} ago`;
+  $("updated").textContent = !S ? "" : S.starting && S.running ? "starting up (loading markets)" :
+    slow ? `cycle running ${dur(S.cycle_running)} (exchange slow)` : `last cycle ${dur(S.age)} ago`;
 
   // alerts
   const alerts = [];
