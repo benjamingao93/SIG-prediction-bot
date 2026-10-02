@@ -116,6 +116,30 @@ share the account's rate limit.
 If both probabilities are blank, the fundamentals model is the only view on that market. The file is reloaded
 every minute while the bot runs.
 
+## Fair value: Kalshi + forecaster ratings (`sigbot kalshi`, `sigbot edges`)
+
+A real-money market and the professional forecasters, as a check on SIG's prices. No trading yet.
+
+```bash
+sigbot races            # also parses nominee names and the forecasters' ratings into races.csv
+sigbot kalshi           # map each two-party Senate/Governor race to its Kalshi event, store prices
+sigbot edges --refresh  # fetch Kalshi again, then print where SIG disagrees (also on the dashboard)
+```
+
+- **Kalshi** (public API, no account): the general-election event per race, cached in
+  `data/kalshi_map.csv` (set `manual=1` on a row to pin your own choice). Markets listed by party or
+  by candidate are matched to D/R with the nominee names from Wikipedia. A quote is used only when
+  both parties' spreads are ≤ `DIR_MAX_KALSHI_SPREAD` (0.04), there is enough open interest, and
+  other candidates are priced ≤ `DIR_MAX_OTHER` (0.05).
+- **Ratings**: each forecaster's rating (Safe/Solid 0.97, Likely 0.88, Lean 0.72, Tilt 0.60,
+  Toss-up 0.50) averaged into P(Democrat wins).
+- **Fair value**: a log-odds blend, `DIR_KALSHI_WEIGHT` (0.7) on Kalshi. Its uncertainty grows with
+  Kalshi's spread and with how far the sources disagree; ratings alone count as coarse.
+- **Edge**: a view is always bought as NO on the *other* party ("Democrat underpriced" = buy NO on
+  the Republican at `1 − bid`), so it never buys YES where baskets hold NO. A view clears the bar
+  when edge > `DIR_MIN_EDGE` (0.02) + uncertainty and, with `DIR_REQUIRE_AGREEMENT`, every source
+  alone also sees an edge.
+
 ## Fundamentals model: `data/races.csv`
 
 `sigbot races` pulls every 2026 House, Senate and Governor race from Wikipedia: Cook PVI, the

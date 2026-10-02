@@ -16,6 +16,9 @@ Columns:
   margin_adj    - YOUR adjustment to the expected Dem margin, in points (candidate quality etc.)
   skip          - 1 to give no opinion on this race
   notes
+  d_names, r_names - nominee names, ";"-separated (Senate/Governor); used to match Kalshi markets
+  rating_p_d    - forecasters' average P(Democrat wins) from the Wikipedia ratings tables
+  rating_n, rating_spread - how many rated it, and max − min of their P(D)
 """
 from __future__ import annotations
 
@@ -26,7 +29,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 COLUMNS = ["race", "office", "pvi_d", "inc_party", "inc_running", "last_year", "last_margin_d",
-           "has_d", "has_r", "margin_adj", "skip", "notes"]
+           "has_d", "has_r", "margin_adj", "skip", "notes", "d_names", "r_names",
+           "rating_p_d", "rating_n", "rating_spread"]
 USER_COLUMNS = ("margin_adj", "skip", "notes")
 
 WIKI_RAW = "https://en.wikipedia.org/w/index.php?title={}&action=raw"
@@ -64,6 +68,11 @@ class Race:
     margin_adj: float = 0.0
     skip: bool = False
     notes: str = ""
+    d_names: str = ""  # nominees, ";"-separated (several for top-four or jungle ballots)
+    r_names: str = ""
+    rating_p_d: Optional[float] = None  # forecasters' average P(Democrat wins)
+    rating_n: int = 0  # how many forecasters rated the race
+    rating_spread: Optional[float] = None  # max − min of their P(D)
 
 
 # ---------- CSV ----------
@@ -100,6 +109,11 @@ def load_races(path: Path) -> Dict[str, Race]:
                 margin_adj=_num(row.get("margin_adj", "")) or 0.0,
                 skip=_flag(row.get("skip", "")),
                 notes=(row.get("notes") or "").strip(),
+                d_names=(row.get("d_names") or "").strip(),
+                r_names=(row.get("r_names") or "").strip(),
+                rating_p_d=_num(row.get("rating_p_d", "")),
+                rating_n=int(_num(row.get("rating_n", "")) or 0),
+                rating_spread=_num(row.get("rating_spread", "")),
             )
     return out
 
@@ -116,7 +130,9 @@ def write_races(path: Path, races: Iterable[Race]) -> None:
             w.writerow([r.race, r.office, f"{r.pvi_d:g}", r.inc_party, b(r.inc_running),
                         r.last_year or "", "" if r.last_margin_d is None else f"{r.last_margin_d:g}",
                         b(r.has_d), b(r.has_r), f"{r.margin_adj:g}" if r.margin_adj else "",
-                        "1" if r.skip else "", r.notes])
+                        "1" if r.skip else "", r.notes, r.d_names, r.r_names,
+                        "" if r.rating_p_d is None else f"{r.rating_p_d:.4f}", r.rating_n or "",
+                        "" if r.rating_spread is None else f"{r.rating_spread:.4f}"])
 
 
 def merge_user_columns(fresh: Iterable[Race], existing: Dict[str, Race]) -> List[Race]:
@@ -158,6 +174,64 @@ def _party_letter(name: str) -> str:
 
 def _candidate_parties(text: str) -> set:
     return {_party_letter(p) for p in _STRIPE.findall(text)}
+
+
+_LINK = re.compile(r"\[\[(?:[^\]|]*\|)?([^\]]+)\]\]")
+
+
+def candidate_names(row: str) -> Dict[str, List[str]]:
+    """Party letter → nominee names, from a row's candidate list, e.g.
+    `*{{Party stripe|Democratic Party (US)}}[[Mary Peltola]] (Democratic)<ref ...>`."""
+    out: Dict[str, List[str]] = {"D": [], "R": [], "I": []}
+    for line in row.split("\n"):
+        m = re.search(r"\{\{Party stripe\|([^}|]+)\}\}(.*)", line)
+        if not m:
+            continue
+        text = re.sub(r"<ref[^>]*/>|<ref.*?(?:</ref>|$)", "", m.group(2))
+        text = _LINK.sub(lambda x: x.group(1), text)
+        text = re.sub(r"\{\{[^}]*\}\}", "", text)
+        name = re.sub(r"\s*\([^()]*\)\s*$", "", text.strip()).strip(" '*")  # drop "(Democratic)"
+        if name:
+            out[_party_letter(m.group(1))].append(name)
+    return out
+
+
+_RATING = re.compile(r"\{\{\s*USRaceRating\s*\|([^}]*)\}\}", re.I)
+# Forecaster rating → P(the rated party wins). Tunable priors, not fitted.
+RATING_P = {"safe": 0.97, "solid": 0.97, "likely": 0.88, "lean": 0.72, "tilt": 0.60}
+
+
+def ratings_p_d(row: str) -> List[float]:
+    """Each forecaster's rating in a predictions-table row, as P(Democrat wins)."""
+    out = []
+    for body in _RATING.findall(row):
+        parts = [p.strip() for p in body.split("|")]
+        level = parts[0].lower()
+        if level in ("tossup", "toss-up"):
+            out.append(0.5)
+            continue
+        party = parts[1].upper() if len(parts) > 1 else ""
+        if level in RATING_P and party in ("D", "R"):
+            out.append(RATING_P[level] if party == "D" else 1 - RATING_P[level])
+    return out
+
+
+def parse_ratings(wiki: str) -> Dict[str, List[float]]:
+    """State → forecasters' P(D) from a page's predictions table."""
+    out: Dict[str, List[float]] = {}
+    for row in _rows(_section(wiki, r"\n==\s*Predictions\s*==")):
+        st, ps = _state_of(row), ratings_p_d(row)
+        if st and ps:
+            out.setdefault(st, ps)
+    return out
+
+
+def _with_names_and_ratings(r: "Race", row: str, ratings: Dict[str, List[float]], st: str) -> "Race":
+    names = candidate_names(row)
+    ps = ratings.get(st) or []
+    return replace(r, d_names=";".join(names["D"]), r_names=";".join(names["R"]),
+                   rating_p_d=sum(ps) / len(ps) if ps else None, rating_n=len(ps),
+                   rating_spread=(max(ps) - min(ps)) if ps else None)
 
 
 def _rows(table_text: str) -> List[str]:
@@ -287,6 +361,7 @@ _STATUS = re.compile(r"Incumbent|[Aa]ppointee|[Rr]etir|Term-limited|[Ll]ost")
 def parse_senate(wiki: str) -> List[Race]:
     """Regular elections plus the specials (OH, FL), which sit in their own table."""
     pvis = parse_state_pvis(wiki)
+    ratings = parse_ratings(wiki)
     body = (_section(wiki, r"=== Special elections during the preceding Congress ===")
             + _section(wiki, r"=== Elections leading to the next Congress ==="))
     out = []
@@ -300,14 +375,16 @@ def parse_senate(wiki: str) -> List[Race]:
         years = [int(y) for y in re.findall(r"\[\[(\d{4})[–-]?\d* United States Senate", cells[4] if len(cells) > 4 else "")]
         status = next((c for c in cells[5:] if _STATUS.search(c)), "")
         parties = _candidate_parties(row)
-        out.append(Race(f"S-{st}", "senate", pvi or 0.0, _inc_party(row), _incumbent_running(status),
-                        last_year=max(years) if years else None, last_margin_d=_last_result(row),
-                        has_d="D" in parties, has_r="R" in parties))
+        r = Race(f"S-{st}", "senate", pvi or 0.0, _inc_party(row), _incumbent_running(status),
+                 last_year=max(years) if years else None, last_margin_d=_last_result(row),
+                 has_d="D" in parties, has_r="R" in parties)
+        out.append(_with_names_and_ratings(r, row, ratings, st))
     return out
 
 
 def parse_governor(wiki: str) -> List[Race]:
     pvis = parse_state_pvis(wiki)
+    ratings = parse_ratings(wiki)
     body = _section(wiki, r"=== States ===")
     out = []
     for row in _rows(body):
@@ -318,9 +395,10 @@ def parse_governor(wiki: str) -> List[Race]:
         status = cells[5] if len(cells) > 5 else ""
         # Governors were last elected in 2022, except two-year terms in NH and VT.
         parties = _candidate_parties(row)
-        out.append(Race(f"G-{st}", "governor", pvis[st], _inc_party(row), _incumbent_running(status),
-                        last_year=2024 if st in ("NH", "VT") else 2022, last_margin_d=_last_result(row),
-                        has_d="D" in parties, has_r="R" in parties))
+        r = Race(f"G-{st}", "governor", pvis[st], _inc_party(row), _incumbent_running(status),
+                 last_year=2024 if st in ("NH", "VT") else 2022, last_margin_d=_last_result(row),
+                 has_d="D" in parties, has_r="R" in parties)
+        out.append(_with_names_and_ratings(r, row, ratings, st))
     return out
 
 

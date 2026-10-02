@@ -10,3 +10,4 @@ data/inputs.csv
 KILL
 data/races.csv
 *.log
+data/kalshi_map.csv

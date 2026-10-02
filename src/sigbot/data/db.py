@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS signals (
     p_model REAL, p_market REAL, uncertainty REAL, edge REAL,
     status TEXT, order_id TEXT, response TEXT
 );
+CREATE TABLE IF NOT EXISTS kalshi_quotes (
+    ts TEXT, race TEXT, party TEXT, bid REAL, ask REAL, last REAL,
+    open_interest REAL, volume_24h REAL, tickers TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_kalshi_race_ts ON kalshi_quotes(race, ts);
+CREATE TABLE IF NOT EXISTS edges_snapshot (
+    id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, data TEXT
+);
 CREATE TABLE IF NOT EXISTS arb_quotes (
     race TEXT PRIMARY KEY, data TEXT, updated TEXT
 );
@@ -157,6 +165,32 @@ class DB:
         rep["legs"] = list(by_ex.values())
         self.save_repair(race, rep)
         return rep
+
+    def insert_kalshi(self, quotes: Iterable[Any]) -> None:
+        """Kalshi quotes (data/external/kalshi.KalshiQuote), one snapshot per fetch."""
+        ts = now_iso()
+        self.conn.executemany(
+            "INSERT INTO kalshi_quotes VALUES (?,?,?,?,?,?,?,?,?)",
+            [(ts, q.race, q.party, q.bid, q.ask, q.last, q.open_interest, q.volume_24h, q.tickers) for q in quotes])
+        self.conn.commit()
+
+    def latest_kalshi(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """race → party → the newest Kalshi quote row (with its ts)."""
+        rows = self.conn.execute(
+            "SELECT k.* FROM kalshi_quotes k JOIN (SELECT race, MAX(ts) ts FROM kalshi_quotes GROUP BY race) m "
+            "ON k.race = m.race AND k.ts = m.ts").fetchall()
+        out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for r in rows:
+            out.setdefault(r["race"], {})[r["party"]] = dict(r)
+        return out
+
+    def set_edges(self, data: Any) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO edges_snapshot VALUES (1, ?, ?)", (now_iso(), json.dumps(data)))
+        self.conn.commit()
+
+    def get_edges(self) -> Optional[Dict[str, Any]]:
+        r = self.conn.execute("SELECT ts, data FROM edges_snapshot WHERE id = 1").fetchone()
+        return {"ts": r["ts"], "rows": json.loads(r["data"])} if r else None
 
     def get_quotes(self) -> Dict[str, Dict[str, Any]]:
         """Quotes the arb bot has resting (or had, if it stopped without cancelling)."""

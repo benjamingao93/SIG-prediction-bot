@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from dotenv import load_dotenv
 
@@ -56,6 +56,22 @@ class ArbConfig:
 
 
 @dataclass(frozen=True)
+class DirectionalConfig:
+    """Fair value from Kalshi + forecaster ratings, and the limits for betting on it."""
+    kalshi_weight: float = 0.7  # log-odds weight on Kalshi vs the ratings when both exist
+    max_kalshi_spread: float = 0.04  # ignore a Kalshi quote wider than this (either party)
+    min_kalshi_oi: float = 1000.0  # ...or with less open interest (contracts, both parties)
+    max_other: float = 0.05  # skip races where Kalshi gives non-D/R candidates more than this
+    min_raters: int = 3  # forecaster average needs at least this many ratings
+    min_edge: float = 0.02  # fair probability minus price, per share
+    uncertainty_mult: float = 1.0  # required edge also grows by this × the fair value's uncertainty
+    require_agreement: bool = True  # every available source must say the same side is cheap
+    offices: Tuple[str, ...] = ("senate", "governor")
+    budget: float = 20_000.0  # total cost of directional positions
+    max_race: float = 2_000.0  # cost per race
+
+
+@dataclass(frozen=True)
 class Settings:
     api_key: str
     base_url: str
@@ -71,6 +87,8 @@ class Settings:
     write_budget: int
     risk: RiskLimits
     arb: ArbConfig
+    dir: DirectionalConfig = DirectionalConfig()
+    kalshi_map_path: Path = Path("data/kalshi_map.csv")
 
 
 def _f(name: str, default: Optional[float]) -> Optional[float]:
@@ -119,6 +137,20 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         quote_ttl=int(_f("ARB_QUOTE_TTL", a.quote_ttl)),
         quote_min_life=int(_f("ARB_QUOTE_MIN_LIFE", a.quote_min_life)),
     )
+    dd = DirectionalConfig()
+    directional = DirectionalConfig(
+        kalshi_weight=_f("DIR_KALSHI_WEIGHT", dd.kalshi_weight),
+        max_kalshi_spread=_f("DIR_MAX_KALSHI_SPREAD", dd.max_kalshi_spread),
+        min_kalshi_oi=_f("DIR_MIN_KALSHI_OI", dd.min_kalshi_oi),
+        max_other=_f("DIR_MAX_OTHER", dd.max_other),
+        min_raters=int(_f("DIR_MIN_RATERS", dd.min_raters)),
+        min_edge=_f("DIR_MIN_EDGE", dd.min_edge),
+        uncertainty_mult=_f("DIR_UNCERTAINTY_MULT", dd.uncertainty_mult),
+        require_agreement=os.environ.get("DIR_REQUIRE_AGREEMENT", "true").strip().lower() in ("1", "true", "yes"),
+        offices=tuple(o.strip() for o in os.environ.get("DIR_OFFICES", ",".join(dd.offices)).split(",") if o.strip()),
+        budget=_f("DIR_BUDGET", dd.budget),
+        max_race=_f("DIR_MAX_RACE", dd.max_race),
+    )
     return Settings(
         api_key=api_key,
         base_url=os.environ.get("SIG_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -134,4 +166,6 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         write_budget=int(_f("WRITE_BUDGET", 25)),
         risk=risk,
         arb=arb,
+        dir=directional,
+        kalshi_map_path=Path(os.environ.get("KALSHI_MAP_PATH", "data/kalshi_map.csv")),
     )

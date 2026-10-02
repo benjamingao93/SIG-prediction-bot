@@ -116,6 +116,10 @@ footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
       <h2>Held baskets <span id="held-note"></span></h2>
       <div class="scroll" id="held"></div>
     </section>
+    <section class="panel" id="edges-panel" style="display:none">
+      <h2>Fair value vs SIG <span id="edges-note"></span></h2>
+      <div class="scroll" id="edges"></div>
+    </section>
     <section class="panel" id="quotes-panel" style="display:none">
       <h2>Resting quotes <span id="quotes-note"></span></h2>
       <div class="scroll" id="quotes"></div>
@@ -224,6 +228,23 @@ function render(d) {
       `<td class="num">${num(h.exit_at, 3)}</td>` +
       `<td class="num">${h.sum_ask == null || h.exit_at == null ? "–" : signed(h.exit_at - h.sum_ask, 3)}</td></tr>`),
     S ? "No baskets held (positions refresh once a minute)." : "Waiting for the bot's first heartbeat.");
+
+  // fair value vs SIG (last `sigbot edges` snapshot)
+  const E = L.edges;
+  $("edges-panel").style.display = E ? "" : "none";
+  if (E) {
+    const rows = E.rows.filter((e) => e.edge > 0).sort((a, b) => b.edge - a.edge).slice(0, 25);
+    const n = E.rows.filter((e) => e.tradeable && e.agree).length;
+    $("edges-note").textContent = `snapshot ${dur((Date.now() - new Date(E.ts)) / 1000)} ago · ${n} clear the bar with sources agreeing`;
+    $("edges").innerHTML = table(
+      [["Race"], ["View"], ["Price", "num"], ["Fair", "num"], ["Edge", "num"], ["Needs", "num"], ["Kalshi", "num"], ["Ratings", "num"], [""]],
+      rows.map((e) => `<tr><td>${esc(e.race)}</td><td>${esc(e.view)} wins</td>` +
+        `<td class="num">${num(e.price, 3)}</td><td class="num">${num(e.fair, 3)}</td>` +
+        `<td class="num">${signed(e.edge, 3)}</td><td class="num">${num(e.required, 3)}</td>` +
+        `<td class="num">${num(e.kalshi_p_d, 3)}</td><td class="num">${num(e.rating_p_d, 3)}</td>` +
+        `<td>${e.tradeable && e.agree ? '<span class="tag ok">edge</span>' : e.agree ? "" : '<span class="tag err">disagree</span>'}</td></tr>`),
+      "No positive edges in the last snapshot.");
+  }
 
   // resting quotes (sigbot arb --quote)
   const QS = S?.quoting;

@@ -163,6 +163,7 @@ def local_state(db: DB, s: Settings) -> Dict[str, Any]:
     return {
         "status": status,
         "repairs": db.get_repairs(),
+        "edges": db.get_edges(),  # last `sigbot edges` snapshot: SIG vs Kalshi + ratings
         "kill_switch": s.kill_switch.exists(),
         "orders": rows,
         "live_trades": len(live),

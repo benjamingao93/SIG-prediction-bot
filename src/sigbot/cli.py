@@ -4,6 +4,8 @@
   sigbot markets               list tournament markets (+ --inputs to seed data/inputs.csv)
   sigbot races                 rebuild data/races.csv (PVI, incumbents) from Wikipedia
   sigbot fundamentals          fundamentals model vs market price, biggest gaps first
+  sigbot kalshi [--rediscover] map races to Kalshi and store a snapshot of its prices
+  sigbot edges [--refresh]     where SIG disagrees with Kalshi + forecaster ratings (no trading)
   sigbot collect [--realtime]  stage 1: record prices/books, no trading
   sigbot feed                  realtime book feed, listen-only: logs what the arb bot would do
   sigbot arb                   arbitrage: paper (logs baskets it would buy, sends nothing)
@@ -109,6 +111,22 @@ def cmd_fundamentals(s: Settings, a) -> None:
     print(f"env D{fm.env:+.1f}   model  market   gap")
     for gap, p, last, title in rows[:a.top]:
         print(f"  {p:6.3f}  {last:6.3f}  {gap:+6.3f}  {title}")
+
+
+def cmd_kalshi(s: Settings, a) -> None:
+    from .edges import sync_kalshi
+    n_races, n_quotes = sync_kalshi(s, _client(s), DB(s.db_path), rediscover=a.rediscover)
+    print(f"Kalshi: {n_races} races mapped ({s.kalshi_map_path}), {n_quotes} party quotes stored")
+
+
+def cmd_edges(s: Settings, a) -> None:
+    from .edges import compute_edges, kalshi_age_minutes, report, sync_kalshi
+    c, db = _client(s), DB(s.db_path)
+    if a.refresh:
+        sync_kalshi(s, c, db)
+    rows = compute_edges(s, c, db)
+    db.set_edges([e.as_row() for e in rows])
+    print(report(rows, a.top, a.all, kalshi_age_minutes(db)))
 
 
 def cmd_collect(s: Settings, a) -> None:
@@ -255,6 +273,12 @@ def main(argv=None) -> None:
     m = sub.add_parser("markets"); m.add_argument("--inputs", action="store_true"); m.set_defaults(fn=cmd_markets)
     sub.add_parser("races").set_defaults(fn=cmd_races)
     f = sub.add_parser("fundamentals"); f.add_argument("--top", type=int, default=60); f.set_defaults(fn=cmd_fundamentals)
+    k = sub.add_parser("kalshi"); k.add_argument("--rediscover", action="store_true",
+                                                 help="re-pick every race's Kalshi event (keeps manual=1 rows)")
+    k.set_defaults(fn=cmd_kalshi)
+    e = sub.add_parser("edges"); e.add_argument("--refresh", action="store_true", help="fetch Kalshi first")
+    e.add_argument("--top", type=int, default=30); e.add_argument("--all", action="store_true")
+    e.set_defaults(fn=cmd_edges)
     c = sub.add_parser("collect"); c.add_argument("--realtime", action="store_true")
     c.add_argument("--cycles", type=int); c.set_defaults(fn=cmd_collect)
     fd = sub.add_parser("feed"); fd.add_argument("--read-budget", type=int, default=15,
