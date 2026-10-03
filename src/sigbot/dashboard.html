@@ -78,6 +78,17 @@ tr:last-child td { border-bottom: none; }
 .gapbar .mark { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text); }
 .mono { font-family: var(--mono); font-size: 12px; }
 footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
+button { font: inherit; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+button:hover { border-color: var(--muted); }
+button.danger { color: #fff; background: var(--bad); border-color: var(--bad); }
+button:disabled { opacity: .5; cursor: default; }
+.sellform { padding: 12px 16px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+.sellform label { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
+.sellform input[type=number] { width: 96px; font: inherit; padding: 4px 6px; border-radius: 6px;
+  border: 1px solid var(--line); background: var(--bg); color: var(--text); font-variant-numeric: tabular-nums; }
+.sellform .msg { font-size: 12px; }
+.manual { padding: 8px 16px 12px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); display: grid; gap: 4px; }
 </style>
 </head>
 <body>
@@ -119,6 +130,8 @@ footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
     <section class="panel" id="dir-panel" style="display:none">
       <h2>Directional book <span id="dir-note"></span></h2>
       <div class="scroll" id="dir"></div>
+      <div id="dir-sell"></div>
+      <div id="dir-manual"></div>
     </section>
     <section class="panel" id="edges-panel" style="display:none">
       <h2>Fair value vs SIG <span id="edges-note"></span></h2>
@@ -141,7 +154,7 @@ footer { color: var(--muted); font-size: 12px; margin-top: 16px; }
       <div class="scroll" id="positions"></div>
     </section>
   </div>
-  <footer>Bot data refreshes every 3 s; exchange data every 30 s. Read-only: stop the bot with <span class="mono">touch KILL</span>, then <span class="mono">sigbot cancel-all</span>.</footer>
+  <footer>Bot data refreshes every 3 s; exchange data every 30 s. Read-only except manual directional sells, which the running bot carries out. Stop the bot with <span class="mono">touch KILL</span>, then <span class="mono">sigbot cancel-all</span>.</footer>
 </div>
 
 <script>
@@ -240,12 +253,17 @@ function render(d) {
     $("dir-note").textContent = `${D.mode} · ${num(D.used)} of ${num(D.budget)} used · net ${D.net >= 0 ? "D" : "R"} ${num(Math.abs(D.net))} · ` +
       `realized ${D.realized >= 0 ? "+" : ""}${num(D.realized, 2)} · unrealized ${D.unrealized >= 0 ? "+" : ""}${num(D.unrealized, 2)}`;
     $("dir").innerHTML = table(
-      [["Race"], ["View"], ["NO shares", "num"], ["Entry", "num"], ["Sells at", "num"], ["Fair", "num"], ["Unrealized", "num"], [""]],
+      [["Race"], ["View"], ["NO shares", "num"], ["Entry", "num"], ["Sells at", "num"], ["Fair", "num"], ["Unrealized", "num"], [""], [""]],
       D.positions.map((p) => `<tr><td>${esc(p.race)}</td><td>${esc(p.view)} wins</td><td class="num">${num(p.qty)}</td>` +
         `<td class="num">${num(p.entry, 3)}</td><td class="num">${num(p.price, 3)}</td><td class="num">${num(p.fair, 3)}</td>` +
-        `<td class="num">${signed(p.unrealized)}</td><td>${p.halved ? '<span class="tag ok">half taken</span>' : ""}</td></tr>`),
+        `<td class="num">${signed(p.unrealized)}</td><td>${p.halved ? '<span class="tag ok">half taken</span>' : ""}</td>` +
+      `<td><button data-sell="${esc(p.race)}">Sell…</button></td></tr>`),
       "No directional positions.");
+    dirPositions = Object.fromEntries(D.positions.map((p) => [p.race, p]));
+    dirMode = D.mode;
+    renderSellForm();
   }
+  renderManual(L, D);
 
   // fair value vs SIG (last `sigbot edges` snapshot)
   const E = L.edges;
@@ -329,6 +347,96 @@ function render(d) {
       `<td class="num">${num(p.quantity)}</td><td class="num">${num(p.avg_cost, 3)}</td>` +
       `<td class="num">${num(p.price, 3)}</td><td class="num">${signed(p.unrealized)}</td></tr>`),
     "No open positions.");
+}
+
+// ---- manual sells: the page queues a request, the running bot carries it out ----
+let dirPositions = {}, dirMode = "live", sell = null;  // sell: the open form's state
+
+document.addEventListener("click", (ev) => {
+  const t = ev.target;
+  if (t.dataset.sell) {
+    const p = dirPositions[t.dataset.sell];
+    if (p) sell = {race: p.race, qty: Math.floor(p.qty), floor: p.price ?? "", block: true, msg: "", busy: false};
+    renderSellForm(true);
+  } else if (t.id === "sell-cancel") {
+    sell = null; renderSellForm(true);
+  } else if (t.id === "sell-go") {
+    submitSell();
+  } else if (t.dataset.unblock) {
+    post("/api/dir/unblock", {mode: t.dataset.mode, race: t.dataset.unblock}).then(tick);
+  }
+});
+document.addEventListener("input", (ev) => {
+  if (!sell) return;
+  const t = ev.target;
+  if (t.id === "sell-qty") sell.qty = t.value;
+  if (t.id === "sell-floor") sell.floor = t.value;
+  if (t.id === "sell-block") sell.block = t.checked;
+  renderSellSummary();
+});
+
+function renderSellForm(force) {
+  const box = $("dir-sell");
+  if (!sell) { box.innerHTML = ""; return; }
+  if (!force && box.querySelector(".sellform")) { renderSellSummary(); return; }  // don't clobber typing
+  const p = dirPositions[sell.race];
+  box.innerHTML = `<div class="sellform">
+    <strong>Sell ${esc(sell.race)} (${esc(p?.view ?? "")} wins)</strong>
+    <label>Shares <input type="number" id="sell-qty" min="1" step="1" max="${p ? Math.floor(p.qty) : ""}" value="${esc(sell.qty)}"></label>
+    <label>No lower than <input type="number" id="sell-floor" min="0.005" max="0.995" step="0.005" value="${esc(sell.floor)}"></label>
+    <label><input type="checkbox" id="sell-block" ${sell.block ? "checked" : ""}> Stop the bot buying this race again</label>
+    <button class="danger" id="sell-go" ${sell.busy ? "disabled" : ""}>Sell</button>
+    <button id="sell-cancel">Cancel</button>
+    <span class="msg" id="sell-msg"></span></div>`;
+  renderSellSummary();
+}
+
+function renderSellSummary() {
+  const el = $("sell-msg");
+  if (!el || !sell) return;
+  const p = dirPositions[sell.race];
+  if (sell.msg) { el.innerHTML = sell.msg; return; }
+  if (!p) { el.textContent = "This position is gone."; return; }
+  const q = Number(sell.qty), f = Number(sell.floor);
+  const bid = p.price, ok = q >= 1 && q <= p.qty && f > 0 && f < 1;
+  el.innerHTML = !ok ? `<span class="neg">Enter 1–${num(p.qty)} shares and a floor between 0 and 1.</span>` :
+    `Best bid ${num(bid, 3)} · entry ${num(p.entry, 3)} · at the floor that's ` +
+    `${signed((f - p.entry) * q)} vs entry` + (bid != null && f > bid ? ` <span class="neg">· floor is above the best bid: nothing will sell</span>` : "");
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({ok: false, error: `HTTP ${r.status}`}));
+  if (!r.ok || !j.ok) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
+async function submitSell() {
+  if (!sell || sell.busy) return;
+  const p = dirPositions[sell.race];
+  const q = Math.floor(Number(sell.qty)), f = Number(sell.floor);
+  if (!p || !(q >= 1 && q <= p.qty && f > 0 && f < 1)) { renderSellSummary(); return; }
+  if (!confirm(`Sell up to ${num(q)} ${sell.race} shares, no lower than ${f.toFixed(3)}?`)) return;
+  sell.busy = true; renderSellForm(true);
+  try {
+    await post("/api/dir/sell", {mode: dirMode, race: sell.race, qty: q, min_price: f, block: sell.block});
+    sell = null; renderSellForm(true); tick();
+  } catch (e) {
+    sell.busy = false; sell.msg = `<span class="neg">${esc(e.message)}</span>`; renderSellForm(true); sell.msg = "";
+  }
+}
+
+function renderManual(L, D) {
+  const rows = (L.manual || []).slice(0, 5).map((r) => {
+    const tag = r.status === "done" ? "ok" : r.status === "pending" ? "paper" : "err";
+    return `<div><span class="tag ${tag}">${esc(r.status)}</span> ${time(r.created)} · ${esc(r.race)} · ` +
+      `${num(r.sold)} of ${num(r.qty)} sold` + (r.min_price != null ? ` · floor ${num(r.min_price, 3)}` : "") +
+      (r.status === "pending" ? " · waiting for the bot (a few seconds; not while KILL exists)" : "") +
+      (r.note ? ` · ${esc(r.note)}` : "") + `</div>`;
+  });
+  const blocked = (L.blocked || []).map(([mode, race]) =>
+    `<div>Bot won't buy <strong>${esc(race)}</strong> (${esc(mode)}) <button data-unblock="${esc(race)}" data-mode="${esc(mode)}">Unblock</button></div>`);
+  $("dir-manual").innerHTML = rows.length || blocked.length ? `<div class="manual">${[...rows, ...blocked].join("")}</div>` : "";
 }
 
 let inFlight = false;

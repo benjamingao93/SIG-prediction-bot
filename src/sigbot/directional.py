@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from .arb_bot import ArbBot
 
 log = logging.getLogger(__name__)
+MANUAL_EXPIRE = 120.0  # seconds a dashboard sell request waits for the bot before it lapses
 
 
 class Director:
@@ -93,6 +94,7 @@ class Director:
         self._writes = 0
         if self.bot.s.kill_switch.exists():
             return
+        self._manual_sells()  # yours first, whatever the fair value is doing
         fresh = self.bot.fair is not None and self.bot.fair.fresh()
         held = self.positions()
         if fresh:
@@ -108,8 +110,9 @@ class Director:
             return
         # New races, and top-ups of a race already held the same way (up to the race cap). Never
         # the opposite view in a race already held.
+        blocked = self.bot.db.blocked_races(self.mode)  # races you sold by hand and told it to leave
         cands = [e for e in self.bot._edges if e.tradeable and (e.agree or not self.cfg.require_agreement)
-                 and "kalshi" in e.fv.sources and e.race not in self.bot.repairs
+                 and "kalshi" in e.fv.sources and e.race not in self.bot.repairs and e.race not in blocked
                  and (e.race not in held or (held[e.race]["view"] == e.view
                                              and held[e.race]["exchange_id"] == e.buy_exchange
                                              and self.max_race - held[e.race]["cost"] >= self.cfg.min_order))]
@@ -177,7 +180,36 @@ class Director:
         px = self.sell_price(weakest["exchange_id"])
         shares = min(weakest["qty"], math.ceil(need / px))
         return self._sell(weakest, shares, px,
-                          f"recycle {shares} into {best.race} ({best_r:.1%} vs {weakest_r:.1%} left beyond the bar)")
+                          f"recycle {shares} into {best.race} ({best_r:.1%} vs {weakest_r:.1%} left beyond the bar)") > 0
+
+    def _manual_sells(self) -> None:
+        """Sells you asked for on the dashboard: up to qty shares, sweeping the bids down to your
+        floor (or just the best bid without one). Anything unfilled lapses with the order; ask again."""
+        held = self.positions()
+        for r in self.bot.db.pending_manual(self.mode):
+            if time.time() - _epoch(r["created"]) > MANUAL_EXPIRE:
+                self.bot.db.finish_manual(r["id"], "expired", note="the bot didn't get to it in time")
+                continue
+            p = held.get(r["race"])
+            if p is None:
+                self.bot.db.finish_manual(r["id"], "failed", note="no position in this race")
+                continue
+            px = self.sell_price(p["exchange_id"])
+            floor = r["min_price"]
+            if px is None:
+                self.bot.db.finish_manual(r["id"], "failed", note="nobody is bidding")
+                continue
+            if floor is not None and px < floor - 1e-9:
+                self.bot.db.finish_manual(r["id"], "failed", note=f"best bid {px:.3f} is below your floor {floor:.3f}")
+                continue
+            if r["block"]:
+                self.bot.db.block_race(self.mode, r["race"])
+            qty = min(r["qty"], p["qty"])
+            got = self._sell(p, qty, floor if floor is not None else px, "manual, from the dashboard")
+            status = "done" if got >= int(qty) else "partial" if got else "failed"
+            self.bot.db.finish_manual(r["id"], status, sold=got,
+                                      note="" if got >= int(qty) else "not enough bids at or above your floor")
+            held = self.positions()
 
     # ---- exits ----
 
@@ -196,10 +228,11 @@ class Director:
             self._sell(p, math.floor(p["qty"] / 2), px, f"take half: {px:.3f} closed half the gap to {fair:.3f}",
                        halved=True)
 
-    def _sell(self, p: Dict[str, Any], qty: float, px: float, why: str, halved: bool = False) -> bool:
+    def _sell(self, p: Dict[str, Any], qty: float, px: float, why: str, halved: bool = False) -> int:
+        """Sell up to qty NO at px or better; the shares sold."""
         qty = int(qty)
         if qty < 1:
-            return False
+            return 0
         if self.live:
             self._writes += 1
             try:
@@ -207,13 +240,13 @@ class Director:
                                        ttl_seconds=self.bot.cfg.order_ttl)
             except SigAPIError as e:
                 log.error("directional sell %s rejected: %s", p["race"], e)
-                return False
+                return 0
             got = self.bot._settle_leg(r)
             proceeds = abs(float(r.get("totalCost") or 0)) or got * px
         else:
             got, proceeds = qty, qty * px
         if got < 1:
-            return False
+            return 0
         if self.live:
             self.bot.cash += proceeds  # spendable this cycle, as buys already subtract their cost
         cost_out = p["entry_price"] * got
@@ -227,10 +260,10 @@ class Director:
         else:
             self.bot.db.save_dir_position(p)
         self.stats["exits"] += 1
-        self._log(p, "sell", got, px, realized / got)
+        self._log(p, "sell", got, proceeds / got, realized / got)  # the average price actually sold at
         log.info("%s DIRECTIONAL SELL %s %s: %d NO at %.3f, %+.2f (%s)", self.mode.upper(), p["race"], p["view"],
                  got, px, realized, why)
-        return True
+        return int(got)
 
     # ---- entries ----
 

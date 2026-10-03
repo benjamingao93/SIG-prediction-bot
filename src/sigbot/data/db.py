@@ -5,7 +5,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from ..api.models import Market, OrderBook
 
@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS dir_positions (
 );
 CREATE TABLE IF NOT EXISTS dir_realized (
     mode TEXT PRIMARY KEY, realized REAL
+);
+CREATE TABLE IF NOT EXISTS dir_manual (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, mode TEXT, race TEXT, qty REAL, min_price REAL,
+    block INTEGER DEFAULT 1, status TEXT DEFAULT 'pending', sold REAL DEFAULT 0, note TEXT, done TEXT
+);
+CREATE TABLE IF NOT EXISTS dir_blocked (
+    mode TEXT, race TEXT, created TEXT, PRIMARY KEY (mode, race)
 );
 CREATE TABLE IF NOT EXISTS edges_snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT, data TEXT
@@ -234,6 +241,37 @@ class DB:
     def dir_realized(self, mode: str) -> float:
         r = self.conn.execute("SELECT realized FROM dir_realized WHERE mode = ?", (mode,)).fetchone()
         return float(r["realized"]) if r else 0.0
+
+    # ---- manual sells from the dashboard: queued here, carried out by the bot ----
+
+    def add_manual_sell(self, mode: str, race: str, qty: float, min_price: Optional[float], block: bool) -> int:
+        cur = self.conn.execute("INSERT INTO dir_manual (created, mode, race, qty, min_price, block) VALUES (?,?,?,?,?,?)",
+                                (now_iso(), mode, race, qty, min_price, int(block)))
+        self.conn.commit()
+        return int(cur.lastrowid)
+
+    def pending_manual(self, mode: str) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM dir_manual WHERE mode = ? AND status = 'pending' ORDER BY id", (mode,))]
+
+    def finish_manual(self, id_: int, status: str, sold: float = 0.0, note: str = "") -> None:
+        self.conn.execute("UPDATE dir_manual SET status = ?, sold = ?, note = ?, done = ? WHERE id = ?",
+                          (status, sold, note, now_iso(), id_))
+        self.conn.commit()
+
+    def recent_manual(self, limit: int = 8) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM dir_manual ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def block_race(self, mode: str, race: str) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO dir_blocked VALUES (?, ?, ?)", (mode, race, now_iso()))
+        self.conn.commit()
+
+    def unblock_race(self, mode: str, race: str) -> None:
+        self.conn.execute("DELETE FROM dir_blocked WHERE mode = ? AND race = ?", (mode, race))
+        self.conn.commit()
+
+    def blocked_races(self, mode: str) -> Set[str]:
+        return {r["race"] for r in self.conn.execute("SELECT race FROM dir_blocked WHERE mode = ?", (mode,))}
 
     def set_edges(self, data: Any) -> None:
         self.conn.execute("INSERT OR REPLACE INTO edges_snapshot VALUES (1, ?, ?)", (now_iso(), json.dumps(data)))

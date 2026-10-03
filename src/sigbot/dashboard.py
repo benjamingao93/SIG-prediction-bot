@@ -1,6 +1,8 @@
 """Local dashboard: `sigbot dashboard`, then open http://localhost:8050.
 
-Read-only. Bot activity comes from data/sig.db (the arb bot's per-cycle heartbeat and its order
+Read-only, except for manual sells of directional positions: the page queues a request in the
+database (POST /api/dir/sell) and the running bot carries it out on its next cycle, so the bot
+stays the only thing that trades and its ledger stays right. Bot activity comes from data/sig.db (the arb bot's per-cycle heartbeat and its order
 log), which costs no API reads. Exchange data (balance, P&L, positions, fills) is refreshed by a
 background thread every 30 s on a small read budget of its own, so the dashboard can't starve the
 bot of the account's 100 reads/minute, and a slow or rate-limited refresh never holds up a page
@@ -169,8 +171,11 @@ def local_state(db: DB, s: Settings) -> Dict[str, Any]:
     for o in rows:
         o["planned_profit"] = (o["profit_per_set"] or 0) * (o["sets"] or 0)
     live = [o for o in orders.values() if o["mode"] == "live" and o["status"] == "sent"]
+    modes = {"live", "paper"}
     return {
         "status": status,
+        "manual": db.recent_manual(),
+        "blocked": sorted({(m, r) for m in modes for r in db.blocked_races(m)}),
         "repairs": db.get_repairs(),
         "edges": db.get_edges(),  # last `sigbot edges` snapshot: SIG vs Kalshi + ratings
         "kill_switch": s.kill_switch.exists(),
@@ -178,6 +183,25 @@ def local_state(db: DB, s: Settings) -> Dict[str, Any]:
         "live_trades": len(live),
         "live_planned_profit": sum((o["profit_per_set"] or 0) * (o["sets"] or 0) for o in live),
     }
+
+
+def manual_sell(db: DB, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate a sell request from the page and queue it for the bot."""
+    mode, race = body.get("mode"), body.get("race")
+    if mode not in ("live", "paper"):
+        raise ValueError("unknown mode")
+    p = db.dir_positions(mode).get(race)
+    if p is None:
+        raise ValueError(f"no {mode} directional position in {race}")
+    qty = int(float(body.get("qty") or 0))
+    if not 1 <= qty <= p["qty"]:
+        raise ValueError(f"shares must be between 1 and {int(p['qty'])}")
+    floor = body.get("min_price")
+    floor = None if floor in (None, "") else float(floor)
+    if floor is not None and not 0 < floor < 1:
+        raise ValueError("the floor price must be between 0 and 1")
+    id_ = db.add_manual_sell(mode, race, qty, floor, bool(body.get("block", True)))
+    return {"ok": True, "id": id_}
 
 
 def serve(s: Settings, port: int = 8050) -> None:
@@ -198,6 +222,31 @@ def serve(s: Settings, port: int = 8050) -> None:
                 self._send(200, "application/json", body)
             else:
                 self._send(404, "text/plain", b"not found")
+
+        def do_POST(self):
+            # JSON only: a page on another site can't send that to localhost without a CORS preflight,
+            # which this server never answers, so only this dashboard can queue a sell.
+            if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/json":
+                return self._json(415, {"ok": False, "error": "send JSON"})
+            origin = self.headers.get("Origin")
+            if origin and not re.match(r"^http://(localhost|127\.0\.0\.1|\[::1\]):%d$" % port, origin):
+                return self._json(403, {"ok": False, "error": "wrong origin"})
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+                with db_lock:
+                    if self.path == "/api/dir/sell":
+                        out = manual_sell(db, body)
+                    elif self.path == "/api/dir/unblock":
+                        db.unblock_race(body.get("mode"), body.get("race"))
+                        out = {"ok": True}
+                    else:
+                        return self._json(404, {"ok": False, "error": "not found"})
+                self._json(200, out)
+            except (ValueError, TypeError) as e:
+                self._json(400, {"ok": False, "error": str(e)})
+
+        def _json(self, code: int, obj: Dict[str, Any]) -> None:
+            self._send(code, "application/json", json.dumps(obj).encode())
 
         def _send(self, code: int, ctype: str, body: bytes) -> None:
             try:

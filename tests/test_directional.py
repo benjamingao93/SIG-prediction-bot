@@ -321,3 +321,37 @@ def test_a_partly_filled_half_sale_is_tried_again(tmp_path, monkeypatch):
     assert after["qty"] == p["qty"] - 51 and after["halved"] == 0  # not done: try again
     d._manage(after)
     assert d.positions()["S-RI"]["qty"] == p["qty"] - 102
+
+
+def test_manual_sell_from_the_dashboard_sells_to_the_floor_and_blocks_the_race(tmp_path, monkeypatch):
+    fake = FakeOrders()
+    monkeypatch.setattr(directional, "orders", fake)
+    d, bot = make(tmp_path, live=True)
+    d.step()
+    p = d.positions()["S-RI"]
+    bot.db.add_manual_sell("live", "S-RI", 100, 0.90, True)
+    d.step()
+    assert ("e2", "no", "sell", 100, 0.9) in fake.calls  # a limit at your floor: sweeps the bids down to it
+    assert d.positions()["S-RI"]["qty"] == p["qty"] - 100
+    r = bot.db.recent_manual()[0]
+    assert r["status"] == "done" and r["sold"] == 100
+    assert "S-RI" in bot.db.blocked_races("live")
+    n = len(fake.calls)
+    d.step()  # the edge is still there, but the race is blocked: no top-up
+    assert not [c for c in fake.calls[n:] if c[2] == "buy" and c[0] == "e2"]
+
+
+def test_manual_sell_refuses_a_floor_above_the_bid_and_lapses_when_old(tmp_path, monkeypatch):
+    fake = FakeOrders()
+    monkeypatch.setattr(directional, "orders", fake)
+    d, bot = make(tmp_path, live=True)
+    d.step()
+    bot.db.add_manual_sell("live", "S-RI", 100, 0.99, False)  # bid is .92
+    bot.db.add_manual_sell("live", "S-RI", 100, None, False)
+    bot.db.conn.execute("UPDATE dir_manual SET created = '2020-01-01T00:00:00+00:00' WHERE id = 2")
+    n = len(fake.calls)
+    d.step()
+    st = {r["id"]: r for r in bot.db.recent_manual()}
+    assert st[1]["status"] == "failed" and "below your floor" in st[1]["note"]
+    assert st[2]["status"] == "expired"
+    assert not [c for c in fake.calls[n:] if c[2] == "sell"]

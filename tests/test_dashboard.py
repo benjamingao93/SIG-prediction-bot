@@ -1,4 +1,6 @@
 import time
+
+import pytest
 from types import SimpleNamespace
 
 from sigbot.dashboard import local_state
@@ -36,3 +38,19 @@ def test_a_starting_bot_shows_as_live(tmp_path):
     db.set_alive(None, 0, "live", starting=True)
     st = local_state(db, s)["status"]
     assert st["running"] is True and st["starting"] is True
+
+
+def test_manual_sell_request_is_validated_and_queued(tmp_path):
+    from sigbot.dashboard import manual_sell
+    from sigbot.data.db import DB
+    db = DB(tmp_path / "t.db")
+    db.save_dir_position({"mode": "live", "race": "S-RI", "view": "D", "exchange_id": "e2", "qty": 500,
+                          "cost": 450.0, "entry_price": .9, "halved": 0, "realized": 0.0})
+    with pytest.raises(ValueError):
+        manual_sell(db, {"mode": "live", "race": "S-XX", "qty": 10})
+    with pytest.raises(ValueError):
+        manual_sell(db, {"mode": "live", "race": "S-RI", "qty": 501})
+    with pytest.raises(ValueError):
+        manual_sell(db, {"mode": "live", "race": "S-RI", "qty": 10, "min_price": 1.2})
+    assert manual_sell(db, {"mode": "live", "race": "S-RI", "qty": 10, "min_price": .88})["ok"]
+    assert db.pending_manual("live")[0]["qty"] == 10
