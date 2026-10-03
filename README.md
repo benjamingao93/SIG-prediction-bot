@@ -37,7 +37,7 @@ repair, saved in the database: every cycle the bot buys what it can of the missi
 current book, up to break-even plus `ARB_REPAIR_SLIPPAGE`, and trades nothing else in that race
 until it is hedged. For a gap made any other way: `sigbot hedge "Alaska Senate" --max-price 0.34`.
 
-`sigbot dashboard` serves a read-only view at http://localhost:8050: bot status, alerts, unhedged
+`sigbot dashboard` serves a view (read-only apart from manual directional sells) at http://localhost:8050: bot status, alerts, unhedged
 races and pending repairs, the races closest to triggering, the bot's orders, and your fills and
 positions from the exchange.
 
@@ -190,6 +190,12 @@ sigbot arb --live --directional         # real directional orders (5,000 / 500 t
 
 The dashboard's **Directional book** panel shows positions, entry vs. sell price vs. fair value,
 budget used, net direction and P&L; `sigbot convergence` shows how fast gaps have been closing.
+
+**Selling by hand**: each position has a **Sell…** button. Choose the shares, a floor price (sells
+sweep the bids down to it and no lower) and whether the bot may buy the race again. The page only
+queues the request; the running bot sells on its next cycle (not while `KILL` exists), and a request
+it hasn't reached within 2 minutes lapses. Blocked races are listed under the panel with an
+**Unblock** button.
 
 ## Fundamentals model: `data/races.csv`
 
