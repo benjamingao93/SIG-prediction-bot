@@ -244,3 +244,26 @@ def test_never_bets_the_opposite_way_in_a_held_race(tmp_path):
     d.step()
     p = d.positions()["S-RI"]
     assert p["view"] == "R" and p["qty"] == 526  # the cheap "D wins" side wasn't added
+
+
+def test_recently_topped_up_position_is_protected_from_recycling(tmp_path):
+    from datetime import datetime, timezone
+    d, bot = make(tmp_path, dcfg=DirectionalConfig(directional=True, budget=1_000, max_race=1_000))
+    old = {"mode": "paper", "race": "S-ME", "view": "D", "exchange_id": "e4", "market_id": "4", "title": "",
+           "qty": 1700, "cost": 977.5, "entry_price": .575, "fair_entry": .593, "halved": 0, "realized": 0.0,
+           "opened": "2026-10-01T00:00:00+00:00",  # opened long ago...
+           "last_buy": datetime.now(timezone.utc).isoformat(timespec="seconds")}  # ...but added to just now
+    bot.db.save_dir_position(old)
+    bot._quotes["e4"] = (.42, .43)
+    d.step()
+    assert "S-ME" in d.positions()
+
+
+def test_nearly_out_of_cash_only_buys_the_best_gap(tmp_path, monkeypatch):
+    fake = FakeOrders()
+    monkeypatch.setattr(directional, "orders", fake)
+    dcfg = DirectionalConfig(directional=True, live_budget=50_000, live_max_race=10_000, cash_reserve=2_000)
+    d, bot = make(tmp_path, live=True, dcfg=dcfg)
+    bot.cash = 2_600  # 600 above the reserve: below the 1,000 "nearly out" line
+    d.step()
+    assert {c[0] for c in fake.calls} == {"e2"}  # RI only (best return on capital), no ME top-up

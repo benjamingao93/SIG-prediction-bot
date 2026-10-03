@@ -30,7 +30,7 @@ from .api.client import SigAPIError
 from .models.fairvalue import Edge
 from .trading import arb
 from .trading.sizing import kelly_shares
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def _epoch(iso: Optional[str]) -> float:
@@ -113,6 +113,8 @@ class Director:
         if cands and self.room(held) < max(self.cfg.min_order, min(self.max_race, 1000.0)):
             self._recycle(cands[0], held)
             held = self.positions()
+        if self.live and self.bot.cash - self.cfg.cash_reserve < max(self.cfg.min_order, 1000.0):
+            cands = cands[:1]  # nearly out of cash: no small top-ups that recycling would undo
         for e in cands:
             if self._writes >= self.cfg.writes_per_cycle or not self.bot._can_read(1):
                 break
@@ -135,14 +137,14 @@ class Director:
 
     def _recycle(self, best: Edge, held: Dict[str, Dict[str, Any]]) -> None:
         """Budget or cash is full: sell the position with the least return left if the best new
-        gap beats it by recycle_margin. Positions under 30 minutes old are left alone."""
+        gap beats it by recycle_margin. Positions bought into in the last 30 minutes are left alone."""
         now = time.time()
         scored = []
         for p in held.values():
             if p["race"] == best.race:
                 continue  # never sell a race just to buy it back
             r = self.remaining_return(p)
-            age = now - _epoch(p.get("opened"))
+            age = now - _epoch(p.get("last_buy") or p.get("opened"))  # protected 30 min after any buy
             if r is not None and age >= 1800:
                 scored.append((r, p))
         if not scored:
@@ -241,14 +243,16 @@ class Director:
             return
         market = next((l for b in self.bot.baskets if b.key == e.race for l in b.legs
                        if l.exchange_id == e.buy_exchange), None)
+        bought_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         if have:  # top-up: one position per race, entry price averaged over all buys
             p = {**have, "qty": have["qty"] + got, "cost": have["cost"] + cost,
-                 "entry_price": (have["cost"] + cost) / (have["qty"] + got), "fair_entry": e.fair}
+                 "entry_price": (have["cost"] + cost) / (have["qty"] + got), "fair_entry": e.fair,
+                 "last_buy": bought_at}
         else:
             p = {"mode": self.mode, "race": e.race, "view": e.view, "exchange_id": e.buy_exchange,
                  "market_id": market.market_id if market else None, "title": market.title if market else "",
                  "qty": got, "cost": cost, "entry_price": cost / got, "fair_entry": e.fair, "halved": 0,
-                 "realized": 0.0}
+                 "realized": 0.0, "last_buy": bought_at}
         self.bot.db.save_dir_position(p)
         self.bot.cash -= cost if self.live else 0
         self.stats["entries"] += 1

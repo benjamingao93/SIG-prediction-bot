@@ -50,7 +50,7 @@ CREATE INDEX IF NOT EXISTS ix_edges_history ON edges_history(race, view, ts);
 CREATE TABLE IF NOT EXISTS dir_positions (
     mode TEXT, race TEXT, view TEXT, exchange_id TEXT, market_id TEXT, title TEXT,
     qty REAL, cost REAL, entry_price REAL, fair_entry REAL, halved INTEGER DEFAULT 0,
-    realized REAL DEFAULT 0, opened TEXT, updated TEXT, PRIMARY KEY (mode, race)
+    realized REAL DEFAULT 0, opened TEXT, updated TEXT, last_buy TEXT, PRIMARY KEY (mode, race)
 );
 CREATE TABLE IF NOT EXISTS dir_realized (
     mode TEXT PRIMARY KEY, realized REAL
@@ -91,6 +91,9 @@ class DB:
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(bot_alive)")}
         if "starting" not in cols:  # databases created before the column existed
             self.conn.execute("ALTER TABLE bot_alive ADD COLUMN starting INTEGER DEFAULT 0")
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(dir_positions)")}
+        if "last_buy" not in cols:
+            self.conn.execute("ALTER TABLE dir_positions ADD COLUMN last_buy TEXT")
 
     def upsert_markets(self, markets: Iterable[Market]) -> None:
         ts = now_iso()
@@ -212,7 +215,7 @@ class DB:
 
     def save_dir_position(self, p: Dict[str, Any]) -> None:
         cols = ["mode", "race", "view", "exchange_id", "market_id", "title", "qty", "cost", "entry_price",
-                "fair_entry", "halved", "realized", "opened", "updated"]
+                "fair_entry", "halved", "realized", "opened", "updated", "last_buy"]
         p = {**p, "updated": now_iso(), "opened": p.get("opened") or now_iso()}
         self.conn.execute(f"INSERT OR REPLACE INTO dir_positions ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
                           [p.get(c) for c in cols])

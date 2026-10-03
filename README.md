@@ -173,7 +173,9 @@ so capital turns over instead of waiting for November.
   take most of a large wall.
 - **Recycling**: when the budget or cash is full, the position with the least expected return left,
   (fair − sell price) ÷ sell price, is sold to fund a new gap whose return on capital is at least
-  `DIR_RECYCLE_MARGIN` (0.02) better. Positions under 30 minutes old are left alone.
+  `DIR_RECYCLE_MARGIN` (0.04: a swap pays two spreads) better. Positions bought into during the last 30
+minutes are left alone, and when cash is nearly used up only the single best gap is bought, so small
+top-ups don't get recycled straight back out.
 
 Only one bot may run per database: a second `sigbot arb` exits with the first one's pid.
 
