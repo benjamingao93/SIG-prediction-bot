@@ -218,3 +218,29 @@ def test_second_bot_on_the_same_database_refuses_to_start(tmp_path):
     a._acquire_lock()
     with pytest.raises(SystemExit, match="Another bot is already running"):
         b._acquire_lock()
+
+
+# ---- topping up a race already held ----
+
+def legacy(race="S-RI", view="D", ex="e2", qty=526, entry=.923):
+    return {"mode": "paper", "race": race, "view": view, "exchange_id": ex, "market_id": None, "title": "",
+            "qty": qty, "cost": qty * entry, "entry_price": entry, "fair_entry": .988, "halved": 0, "realized": 0.0}
+
+
+def test_tops_up_a_small_position_to_the_race_cap_with_averaged_entry(tmp_path):
+    d, bot = make(tmp_path, dcfg=DirectionalConfig(directional=True, max_race=2_000))
+    bot.db.save_dir_position(legacy())
+    d.step()
+    p = d.positions()["S-RI"]
+    assert p["qty"] > 526 and p["cost"] <= 2_000 + 1  # topped up, within the race cap
+    assert p["entry_price"] == pytest.approx(p["cost"] / p["qty"])  # averaged
+    assert .923 < p["entry_price"] < .93  # between the old .923 and the new .93
+
+
+def test_never_bets_the_opposite_way_in_a_held_race(tmp_path):
+    d, bot = make(tmp_path)
+    bot.db.save_dir_position(legacy(view="R", ex="e1", entry=.06))  # held as "R wins"
+    d._manage = lambda p: None  # entries only: its own exit rules would close it first
+    d.step()
+    p = d.positions()["S-RI"]
+    assert p["view"] == "R" and p["qty"] == 526  # the cheap "D wins" side wasn't added

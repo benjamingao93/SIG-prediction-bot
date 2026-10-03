@@ -102,8 +102,13 @@ class Director:
         if self.bot.db.dir_realized(self.mode) + self.unrealized(held) <= -self.cfg.loss_stop:
             log.warning("directional: loss stop reached, no new entries")
             return
+        # New races, and top-ups of a race already held the same way (up to the race cap). Never
+        # the opposite view in a race already held.
         cands = [e for e in self.bot._edges if e.tradeable and (e.agree or not self.cfg.require_agreement)
-                 and "kalshi" in e.fv.sources and e.race not in held and e.race not in self.bot.repairs]
+                 and "kalshi" in e.fv.sources and e.race not in self.bot.repairs
+                 and (e.race not in held or (held[e.race]["view"] == e.view
+                                             and held[e.race]["exchange_id"] == e.buy_exchange
+                                             and self.max_race - held[e.race]["cost"] >= self.cfg.min_order))]
         cands.sort(key=lambda e: -(e.edge / e.price))
         if cands and self.room(held) < max(self.cfg.min_order, min(self.max_race, 1000.0)):
             self._recycle(cands[0], held)
@@ -134,6 +139,8 @@ class Director:
         now = time.time()
         scored = []
         for p in held.values():
+            if p["race"] == best.race:
+                continue  # never sell a race just to buy it back
             r = self.remaining_return(p)
             age = now - _epoch(p.get("opened"))
             if r is not None and age >= 1800:
@@ -205,11 +212,13 @@ class Director:
         if not walk:
             return
         depth_qty, (limit,), total = walk
-        room = min(self.max_race, self.room(held))
+        have = held.get(e.race)
+        room = min(self.max_race - (have["cost"] if have else 0.0), self.room(held))
         net = self.net_direction(held)
         sign = 1 if e.view == "D" else -1
         room = min(room, max(0.0, self.cfg.max_net - sign * net))  # how far this side may still go
-        qty = min(depth_qty, kelly_shares(e.fair, total / depth_qty, self.budget, self.cfg.kelly_fraction),
+        kelly = kelly_shares(e.fair, total / depth_qty, self.budget, self.cfg.kelly_fraction) - (have["qty"] if have else 0)
+        qty = min(depth_qty, kelly,
                   int(room // limit) if limit > 0 else 0)
         if qty < 1 or qty * limit < self.cfg.min_order or self.bot._stale(read_at, f"directional {e.race}"):
             return
@@ -232,9 +241,14 @@ class Director:
             return
         market = next((l for b in self.bot.baskets if b.key == e.race for l in b.legs
                        if l.exchange_id == e.buy_exchange), None)
-        p = {"mode": self.mode, "race": e.race, "view": e.view, "exchange_id": e.buy_exchange,
-             "market_id": market.market_id if market else None, "title": market.title if market else "",
-             "qty": got, "cost": cost, "entry_price": cost / got, "fair_entry": e.fair, "halved": 0, "realized": 0.0}
+        if have:  # top-up: one position per race, entry price averaged over all buys
+            p = {**have, "qty": have["qty"] + got, "cost": have["cost"] + cost,
+                 "entry_price": (have["cost"] + cost) / (have["qty"] + got), "fair_entry": e.fair}
+        else:
+            p = {"mode": self.mode, "race": e.race, "view": e.view, "exchange_id": e.buy_exchange,
+                 "market_id": market.market_id if market else None, "title": market.title if market else "",
+                 "qty": got, "cost": cost, "entry_price": cost / got, "fair_entry": e.fair, "halved": 0,
+                 "realized": 0.0}
         self.bot.db.save_dir_position(p)
         self.bot.cash -= cost if self.live else 0
         self.stats["entries"] += 1
