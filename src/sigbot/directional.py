@@ -219,7 +219,8 @@ class Director:
         cost_out = p["entry_price"] * got
         realized = proceeds - cost_out
         p = {**p, "qty": p["qty"] - got, "cost": p["cost"] - cost_out, "realized": p["realized"] + realized,
-             "halved": 1 if halved or p["halved"] else 0}
+             # A half sale only counts once it fully fills; a partial fill tries again next cycle.
+             "halved": 1 if (halved and got >= qty) or p["halved"] else 0}
         self.bot.db.add_dir_realized(self.mode, realized)
         if p["qty"] < 1:
             self.bot.db.close_dir_position(self.mode, p["race"])

@@ -301,3 +301,23 @@ def test_nearly_out_of_cash_only_buys_the_best_gap(tmp_path, monkeypatch):
     bot.cash = 2_600  # 600 above the reserve: below the 1,000 "nearly out" line
     d.step()
     assert {c[0] for c in fake.calls} == {"e2"}  # RI only (best return on capital), no ME top-up
+
+
+def test_a_partly_filled_half_sale_is_tried_again(tmp_path, monkeypatch):
+    class Thin(FakeOrders):  # only 51 shares bid at the price
+        def place_limit(self, client, ex, side, action, qty, price, tid, ttl_seconds=None):
+            got = min(qty, 51) if action == "sell" else qty
+            self.calls.append((ex, side, action, qty, round(price, 3)))
+            return {"orderId": len(self.calls), "open": False, "quantityTraded": got, "totalCost": got * price}
+    fake = Thin()
+    monkeypatch.setattr(directional, "orders", fake)
+    d, bot = make(tmp_path, live=True)
+    d.step()
+    p = d.positions()["S-RI"]
+    fair = next(e.fair for e in bot._edges if e.race == "S-RI" and e.view == "D")
+    bot._quotes["e2"] = (0.0, round(1 - (p["entry_price"] + 0.6 * (fair - p["entry_price"])), 3))
+    d._manage(p)
+    after = d.positions()["S-RI"]
+    assert after["qty"] == p["qty"] - 51 and after["halved"] == 0  # not done: try again
+    d._manage(after)
+    assert d.positions()["S-RI"]["qty"] == p["qty"] - 102
