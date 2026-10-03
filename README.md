@@ -141,9 +141,11 @@ sigbot edges --refresh  # fetch Kalshi again, then print where SIG disagrees (al
   alone also sees an edge.
 
 **Tracking how fast gaps close.** Once `sigbot races` and `sigbot kalshi` have been run, the arb bot
-keeps fair values live: Kalshi is refreshed every 5 minutes on its own thread (its API, not SIG's
-read budget; quotes older than 15 minutes are ignored), edges are computed from the SIG prices the
-bot already polls, and every 10 minutes they are written to an edge history and the dashboard panel.
+keeps fair values live: Kalshi is refreshed every 15 seconds on its own thread with one batch request
+for all known markets (its API, not SIG's read budget), with a full per-event fetch every 30 minutes to
+pick up new candidates; quotes older than 2 minutes are ignored. Edges are computed from the SIG
+prices the bot already polls, and every 10 minutes they are written to an edge history and the
+dashboard panel (Kalshi snapshots are stored every 5 minutes).
 `sigbot convergence` reads that history: for each view that cleared the bar, how long until the edge
 halved and closed, and whether SIG's price or the fair value did the moving. `DIR_TRACK=false` turns
 it off.

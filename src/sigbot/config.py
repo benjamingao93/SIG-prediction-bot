@@ -70,8 +70,8 @@ class DirectionalConfig:
     budget: float = 20_000.0  # total cost of directional positions
     max_race: float = 2_000.0  # cost per race
     track: bool = True  # the arb bot keeps fair values and an edge history (needs `sigbot kalshi` once)
-    kalshi_refresh: float = 300.0  # seconds between Kalshi refreshes (its own API, not SIG's budget)
-    kalshi_max_age: float = 900.0  # ignore Kalshi quotes older than this
+    kalshi_refresh: float = 15.0  # seconds between Kalshi refreshes: one batch request (its API, not SIG's)
+    kalshi_max_age: float = 120.0  # ignore Kalshi quotes older than this
     history_every: float = 600.0  # seconds between edge-history rows
     # Phase 1 trader (`sigbot arb --directional`): short holds against the fair value.
     directional: bool = False

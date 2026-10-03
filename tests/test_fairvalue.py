@@ -137,3 +137,19 @@ def test_disagreeing_sources_are_flagged():
                     kq((.64, .66), (.34, .36)), CFG)
     d = {e.view: e for e in edges(fv, "eD", "eR", {"eD": (.60, .61), "eR": (.40, .41)}, CFG)}["D"]
     assert not d.agree  # Kalshi .65 > price .60, but the ratings' .40 is below it
+
+
+def test_batch_refresh_groups_markets_back_into_races():
+    race = Race("S-OR", "senate", 8, d_names="Jeff Merkley", r_names="David Brock Smith")
+
+    class Fake:
+        def get(self, path, **kw):
+            assert path == "/markets" and kw["tickers"] == "A,B"
+            return {"markets": [
+                {"ticker": "A", "event_ticker": "SENATEOR-26", "yes_sub_title": "Jeff Merkley",
+                 "yes_bid_dollars": "0.97", "yes_ask_dollars": "0.98", "open_interest_fp": "100"},
+                {"ticker": "B", "event_ticker": "SENATEOR-26", "yes_sub_title": "David Brock Smith",
+                 "yes_bid_dollars": "0.02", "yes_ask_dollars": "0.03", "open_interest_fp": "100"}]}
+    qs = {q.party: q for q in ks.fetch_quotes_batch(Fake(), ["A", "B"], {"S-OR": {"event_ticker": "SENATEOR-26"}},
+                                                    {"S-OR": race})}
+    assert qs["D"].bid == pytest.approx(.97) and qs["R"].ask == pytest.approx(.03)

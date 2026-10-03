@@ -230,3 +230,25 @@ def fetch_quotes(client: KalshiClient, mapping: Dict[str, Dict[str, Any]],
             event = {**event, "markets": ev["markets"]}
         out.extend(quotes_for_event(race, event))
     return out
+
+
+def fetch_quotes_batch(client: KalshiClient, tickers: List[str], mapping: Dict[str, Dict[str, Any]],
+                       races: Dict[str, Race]) -> List[KalshiQuote]:
+    """All known markets in one request (`/markets?tickers=…`, measured at ~0.1 s for 148), grouped
+    back into events → races. New markets only appear after a full `fetch_quotes`."""
+    if not tickers:
+        return []
+    markets: List[Dict[str, Any]] = []
+    for i in range(0, len(tickers), 200):  # keep URLs a sensible length
+        resp = client.get("/markets", tickers=",".join(tickers[i:i + 200]), limit=1000)
+        markets.extend(resp.get("markets") or [])
+    race_of = {m["event_ticker"]: race for race, m in mapping.items()}
+    by_event: Dict[str, List[Dict[str, Any]]] = {}
+    for mk in markets:
+        by_event.setdefault(mk.get("event_ticker", ""), []).append(mk)
+    out: List[KalshiQuote] = []
+    for ev, ms in by_event.items():
+        race = races.get(race_of.get(ev, ""))
+        if race is not None:
+            out.extend(quotes_for_event(race, {"markets": ms}))
+    return out

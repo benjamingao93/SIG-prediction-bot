@@ -20,6 +20,8 @@ from .models.fairvalue import Edge, edges, fair_value
 from .trading.arb import Basket
 
 log = logging.getLogger(__name__)
+FULL_EVERY = 1800.0  # seconds between full per-event fetches (new candidates, new markets)
+STORE_EVERY = 300.0  # seconds between Kalshi snapshots written to the database
 OFFICE_OF = {"S": "senate", "G": "governor", "H": "house"}
 
 
@@ -32,6 +34,9 @@ class FairValueService:
         self.kalshi: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self.updated: float = 0.0  # wall time of the last refresh; nothing is trusted before one
         self.errors = 0
+        self._tickers: List[str] = []  # every market seen in the last full fetch
+        self._full_at = -1e9  # monotonic time of the last full (per-event) fetch
+        self._stored_at = -1e9  # monotonic time quotes were last written to the database
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -43,20 +48,29 @@ class FairValueService:
     # ---- background refresh ----
 
     def refresh(self) -> int:
-        quotes = ks.fetch_quotes(self.kc, self.mapping, self.races)
+        """A full per-event fetch every FULL_EVERY (finds new candidates and markets); in between,
+        one batch request for every known market."""
+        if not self._tickers or time.monotonic() - self._full_at > FULL_EVERY:
+            quotes = ks.fetch_quotes(self.kc, self.mapping, self.races)
+            self._tickers = sorted({t for q in quotes for t in q.tickers.split(",") if t})
+            self._full_at = time.monotonic()
+        else:
+            quotes = ks.fetch_quotes_batch(self.kc, self._tickers, self.mapping, self.races)
         snap: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for q in quotes:
             snap.setdefault(q.race, {})[q.party] = {"bid": q.bid, "ask": q.ask, "last": q.last,
                                                     "open_interest": q.open_interest, "volume_24h": q.volume_24h}
         self.kalshi, self.updated = snap, time.time()  # swapped in one assignment for the bot thread
-        DB(self.s.db_path).insert_kalshi(quotes)  # own connection: this runs on another thread
+        if time.monotonic() - self._stored_at >= STORE_EVERY:  # memory is always fresh; disk every 5 min
+            DB(self.s.db_path).insert_kalshi(quotes)  # own connection: this runs on another thread
+            self._stored_at = time.monotonic()
         return len(quotes)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 n = self.refresh()
-                log.info("kalshi: refreshed %d party quotes", n)
+                log.debug("kalshi: refreshed %d party quotes", n)
             except Exception as e:  # keep the last good snapshot
                 self.errors += 1
                 log.warning("kalshi refresh failed: %s", e)
