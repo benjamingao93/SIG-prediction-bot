@@ -217,6 +217,10 @@ def cmd_hedge(s: Settings, a) -> None:
         return
     held = {str(p.exchange_id): abs(p.quantity) for p in pf.positions(c, s.tournament_slug)
             if p.side == "no" and not p.settled}
+    # NO shares the directional trader holds on purpose aren't part of any basket.
+    for d in db.dir_positions("live").values():
+        if d["exchange_id"] in held:
+            held[d["exchange_id"]] = max(0.0, held[d["exchange_id"]] - d["qty"])
     q = {ex: held.get(ex, 0.0) for ex, _ in legs[key]}
     top = max(q.values())
     short = [{"exchange_id": ex, "title": t, "short": top - q[ex], "cap": a.max_price}

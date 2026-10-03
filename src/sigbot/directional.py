@@ -30,6 +30,14 @@ from .api.client import SigAPIError
 from .models.fairvalue import Edge
 from .trading import arb
 from .trading.sizing import kelly_shares
+from datetime import datetime
+
+
+def _epoch(iso: Optional[str]) -> float:
+    try:
+        return datetime.fromisoformat(iso).timestamp() if iso else time.time()
+    except ValueError:
+        return time.time()
 
 if TYPE_CHECKING:
     from .arb_bot import ArbBot
@@ -96,11 +104,47 @@ class Director:
             return
         cands = [e for e in self.bot._edges if e.tradeable and (e.agree or not self.cfg.require_agreement)
                  and "kalshi" in e.fv.sources and e.race not in held and e.race not in self.bot.repairs]
-        for e in sorted(cands, key=lambda e: -(e.edge / e.price)):
+        cands.sort(key=lambda e: -(e.edge / e.price))
+        if cands and self.room(held) < max(self.cfg.min_order, min(self.max_race, 1000.0)):
+            self._recycle(cands[0], held)
+            held = self.positions()
+        for e in cands:
             if self._writes >= self.cfg.writes_per_cycle or not self.bot._can_read(1):
                 break
             self._enter(e, held)
             held = self.positions()
+
+    def room(self, held: Dict[str, Dict[str, Any]]) -> float:
+        """What a new entry may spend: budget left and, live, cash above the reserve."""
+        left = self.budget - sum(p["cost"] for p in held.values())
+        if self.live:
+            left = min(left, self.bot.cash - self.cfg.cash_reserve)
+        return max(0.0, left)
+
+    def remaining_return(self, p: Dict[str, Any]) -> Optional[float]:
+        """Expected return still left in a position if held: (fair − sell price) ÷ sell price."""
+        fair, px = self._fair(p["race"], p["view"]), self.sell_price(p["exchange_id"])
+        if fair is None or not px:
+            return None
+        return (fair - px) / px
+
+    def _recycle(self, best: Edge, held: Dict[str, Dict[str, Any]]) -> None:
+        """Budget or cash is full: sell the position with the least return left if the best new
+        gap beats it by recycle_margin. Positions under 30 minutes old are left alone."""
+        now = time.time()
+        scored = []
+        for p in held.values():
+            r = self.remaining_return(p)
+            age = now - _epoch(p.get("opened"))
+            if r is not None and age >= 1800:
+                scored.append((r, p))
+        if not scored:
+            return
+        weakest_r, weakest = min(scored, key=lambda x: x[0])
+        if best.edge / best.price - weakest_r < self.cfg.recycle_margin:
+            return
+        px = self.sell_price(weakest["exchange_id"])
+        self._sell(weakest, weakest["qty"], px, f"recycle into {best.race} ({best.edge / best.price:.1%} vs {weakest_r:.1%} left)")
 
     # ---- exits ----
 
@@ -157,22 +201,21 @@ class Director:
         books, read_at = self.bot._books([e.buy_exchange])
         ladder = books[e.buy_exchange].no_asks()
         walk = arb._walk([ladder], lambda prices: e.fair - prices[0], e.required, 10 ** 9,
-                         self.bot.cfg.depth_fraction)
+                         self.cfg.depth_fraction)
         if not walk:
             return
         depth_qty, (limit,), total = walk
-        used = sum(p["cost"] for p in held.values())
-        room = min(self.max_race, self.budget - used)
+        room = min(self.max_race, self.room(held))
         net = self.net_direction(held)
         sign = 1 if e.view == "D" else -1
         room = min(room, max(0.0, self.cfg.max_net - sign * net))  # how far this side may still go
         qty = min(depth_qty, kelly_shares(e.fair, total / depth_qty, self.budget, self.cfg.kelly_fraction),
                   int(room // limit) if limit > 0 else 0)
-        if qty < 1 or self.bot._stale(read_at, f"directional {e.race}"):
+        if qty < 1 or qty * limit < self.cfg.min_order or self.bot._stale(read_at, f"directional {e.race}"):
             return
         # Re-walk for exactly qty shares: the cost and the worst level we actually need.
         _, (limit,), cost = arb._walk([ladder], lambda prices: e.fair - prices[0], e.required, qty,
-                                      self.bot.cfg.depth_fraction)
+                                      self.cfg.depth_fraction)
         if self.live:
             self._writes += 1
             try:

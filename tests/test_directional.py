@@ -164,3 +164,57 @@ def test_directional_paper_inside_a_live_bot(tmp_path, monkeypatch):
     d.step()
     assert d.mode == "paper" and fake.calls == [] and d.positions()  # simulated, nothing sent
     assert d.ledger_qty() == {}  # paper positions never touch basket detection
+
+
+# ---- aggressive-mode safeguards ----
+
+def test_live_entries_keep_the_cash_reserve(tmp_path, monkeypatch):
+    fake = FakeOrders()
+    monkeypatch.setattr(directional, "orders", fake)
+    dcfg = DirectionalConfig(directional=True, live_budget=50_000, live_max_race=10_000, cash_reserve=2_000)
+    d, bot = make(tmp_path, live=True, dcfg=dcfg)
+    bot.cash = 2_500  # only 500 above the reserve
+    d.step()
+    spent = sum(p["cost"] for p in d.positions().values())
+    assert 0 < spent <= 500 + 1
+
+
+def test_min_order_skips_dust(tmp_path):
+    books = {"e2": OrderBook("e2", "2", [Level(.07, 30)], [Level(.08, 30)]),
+             "e4": OrderBook("e4", "4", [Level(.44, 30)], [Level(.45, 30)])}
+    d, bot = make(tmp_path, books=books, dcfg=DirectionalConfig(directional=True, depth_fraction=0.5, min_order=25))
+    d.step()  # 15 shares × .93 = 14 SUSQies: below the minimum
+    assert "S-RI" not in d.positions()
+
+
+def test_recycle_sells_the_weakest_old_position_for_a_better_gap(tmp_path):
+    d, bot = make(tmp_path, dcfg=DirectionalConfig(directional=True, budget=1_000, max_race=1_000))
+    old = {"mode": "paper", "race": "S-ME", "view": "D", "exchange_id": "e4", "market_id": "4", "title": "",
+           "qty": 1700, "cost": 977.5, "entry_price": .575, "fair_entry": .593, "halved": 0, "realized": 0.0,
+           "opened": "2026-10-01T00:00:00+00:00"}
+    bot.db.save_dir_position(old)
+    # NO on R sells at .57: below its .575 entry (no take-profit), fair ≈ .557 is above the stop
+    # (.545), and holding has nothing left to earn, versus RI's ~6%.
+    bot._quotes["e4"] = (.42, .43)
+    d.step()
+    held = d.positions()
+    assert "S-ME" not in held and "S-RI" in held
+
+
+def test_recycle_leaves_young_positions_alone(tmp_path):
+    d, bot = make(tmp_path, dcfg=DirectionalConfig(directional=True, budget=1_000, max_race=1_000))
+    young = {"mode": "paper", "race": "S-ME", "view": "D", "exchange_id": "e4", "market_id": "4", "title": "",
+             "qty": 1700, "cost": 977.5, "entry_price": .575, "fair_entry": .593, "halved": 0, "realized": 0.0}
+    bot.db.save_dir_position(young)  # opened now
+    bot._quotes["e4"] = (.42, .43)
+    d.step()
+    assert "S-ME" in d.positions()
+
+
+def test_second_bot_on_the_same_database_refuses_to_start(tmp_path):
+    from sigbot.arb_bot import ArbBot
+    a, b = ArbBot.__new__(ArbBot), ArbBot.__new__(ArbBot)
+    a.s = b.s = SimpleNamespace(db_path=tmp_path / "sig.db")
+    a._acquire_lock()
+    with pytest.raises(SystemExit, match="Another bot is already running"):
+        b._acquire_lock()

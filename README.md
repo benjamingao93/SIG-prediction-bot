@@ -165,7 +165,15 @@ so capital turns over instead of waiting for November.
 - **Kept apart from the baskets**: positions live in their own ledger, so basket detection, exits,
   repairs and the dashboard's Unhedged panel ignore them.
 - **Budgets**: paper uses `DIR_BUDGET` / `DIR_MAX_RACE` (20,000 / 2,000); live starts at
-  `DIR_LIVE_BUDGET` / `DIR_LIVE_MAX_RACE` (5,000 / 500).
+  `DIR_LIVE_BUDGET` / `DIR_LIVE_MAX_RACE` (5,000 / 500). Live entries also leave
+  `DIR_CASH_RESERVE` (2,000) in cash for repairs and exits, and skip orders under `DIR_MIN_ORDER`.
+- **Depth**: `DIR_DEPTH_FRACTION` (0.5) is how much of each shown level an entry may take; raise it to
+  take most of a large wall.
+- **Recycling**: when the budget or cash is full, the position with the least expected return left,
+  (fair − sell price) ÷ sell price, is sold to fund a new gap whose return on capital is at least
+  `DIR_RECYCLE_MARGIN` (0.02) better. Positions under 30 minutes old are left alone.
+
+Only one bot may run per database: a second `sigbot arb` exits with the first one's pid.
 
 ```bash
 sigbot arb --live --directional-paper   # live arbitrage; directional trader simulated alongside

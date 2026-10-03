@@ -85,6 +85,10 @@ class DirectionalConfig:
     exit_band: float = 0.005  # sell the rest once SIG's sell price is within this of fair value
     stop: float = 0.03  # cut a position once the fair value falls this far below its entry price
     writes_per_cycle: int = 2
+    depth_fraction: float = 0.5  # share of each shown book level an entry may take (its own setting)
+    min_order: float = 25.0  # skip directional orders smaller than this many SUSQies
+    cash_reserve: float = 2_000.0  # cash the directional trader always leaves for repairs and exits
+    recycle_margin: float = 0.02  # sell the weakest position to fund a gap this much better (return on capital)
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,10 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         take_half_at=_f("DIR_TAKE_HALF_AT", dd.take_half_at),
         exit_band=_f("DIR_EXIT_BAND", dd.exit_band),
         stop=_f("DIR_STOP", dd.stop),
+        depth_fraction=_f("DIR_DEPTH_FRACTION", dd.depth_fraction),
+        min_order=_f("DIR_MIN_ORDER", dd.min_order),
+        cash_reserve=_f("DIR_CASH_RESERVE", dd.cash_reserve),
+        recycle_margin=_f("DIR_RECYCLE_MARGIN", dd.recycle_margin),
     )
     return Settings(
         api_key=api_key,

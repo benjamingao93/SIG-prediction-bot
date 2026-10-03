@@ -29,7 +29,9 @@ The kill switch blocks every order, repairs and exits included, and cancels rest
 """
 from __future__ import annotations
 
+import fcntl
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -537,7 +539,27 @@ class ArbBot:
 
     # ---- main loop ----
 
+    def _acquire_lock(self) -> None:
+        """One bot per database: two live bots double their orders and split the read budget
+        (seen live: both sold the same basket in the same second). The OS releases the lock if
+        the process dies, so a crash never leaves it stuck."""
+        path = self.s.db_path.with_suffix(".lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock_file = open(path, "a+")
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self._lock_file.seek(0)
+            other = self._lock_file.read().strip() or "?"
+            raise SystemExit(f"Another bot is already running on {self.s.db_path} (pid {other}). "
+                             f"Stop it first, e.g. `kill {other}`.")
+        self._lock_file.seek(0)
+        self._lock_file.truncate()
+        self._lock_file.write(str(os.getpid()))
+        self._lock_file.flush()
+
     def run(self, max_cycles: Optional[int] = None) -> None:
+        self._acquire_lock()
         # Proof of life first: on a slow exchange the startup reads below take minutes.
         self._starting = True
         threading.Thread(target=self._alive_loop, daemon=True, name="alive").start()
