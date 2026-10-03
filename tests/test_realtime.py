@@ -219,3 +219,19 @@ def test_periodic_reloads_are_queued_oldest_first(monkeypatch):
     r.synced_at = {"fresh": now, "old": now - rt.RESYNC_EVERY - 5, "older": now - rt.RESYNC_EVERY - 50}
     asyncio.run(r._work_resyncs())
     assert reloaded == ["older", "old"]
+
+
+def test_joins_stop_at_the_servers_channel_limit(monkeypatch):
+    monkeypatch.setattr("sigbot.api.realtime.JOIN_WAIT", 0.05)
+    monkeypatch.setattr("sigbot.api.realtime.MAX_CHANNELS", 3)
+    r, sb = runner(market_ids=["a", "b", "c", "d", "e"]), FakeSocket()
+    asyncio.run(r._reconcile(sb))
+    assert set(r.joined) == {"a", "b", "c"}  # the rest would be refused ("Too many channels")
+
+
+def test_a_closed_socket_is_not_open_even_if_the_library_thinks_so():
+    from sigbot.api.realtime import _socket_open
+    sb = lambda ws: SimpleNamespace(realtime=SimpleNamespace(_ws_connection=ws))
+    assert _socket_open(sb(SimpleNamespace(close_code=None, state=SimpleNamespace(name="OPEN"))))
+    assert not _socket_open(sb(SimpleNamespace(close_code=1011, state=SimpleNamespace(name="CLOSED"))))
+    assert not _socket_open(sb(None))

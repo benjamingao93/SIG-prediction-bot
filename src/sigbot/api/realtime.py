@@ -39,6 +39,13 @@ JOIN_BATCH = 10  # channels joined at a time: a batch fits inside JOIN_TIMEOUT a
 JOIN_WAIT = JOIN_TIMEOUT + 5.0  # seconds we wait for a batch's join replies
 JOIN_RETRY_AFTER = 30.0  # seconds before retrying a market that wouldn't join
 VERIFY_LAG = 5.0  # seconds of engine time a feed book may trail REST before it's reloaded
+# The server refuses joins past ~100 channels on one connection ("ChannelRateLimitReached: Too many
+# channels", seen live at 100), so markets beyond this many aren't joined; the user channel is one.
+MAX_CHANNELS = 95
+# A dead socket can keep looking connected (seen live: keepalive timeout, then the library's own
+# reconnect crashed and updates just stopped). No batch on any watched market for this long while
+# subscribed means the connection is rebuilt.
+STALL_SECONDS = 90.0
 # Each batch is sent once and never retried, so the last batch on a quiet market can be dropped with
 # no later gap to reveal it. The docs say to refetch periodically (every one to two minutes): each
 # watched market is reloaded over REST every RESYNC_EVERY, and its books are trusted only while
@@ -118,6 +125,17 @@ class BookStore:
         return {self.market_of[ex] for ex in due if ex in self.market_of}
 
 
+def _socket_open(sb) -> bool:
+    """The library's is_connected only checks that a socket object exists; ask the socket itself."""
+    ws = getattr(sb.realtime, "_ws_connection", None)
+    if ws is None:
+        return False
+    if getattr(ws, "close_code", None) is not None:
+        return False
+    state = getattr(ws, "state", None)
+    return state is None or getattr(state, "name", "OPEN") == "OPEN"
+
+
 class MarketFeed:
     """Revision tracking per market topic. handle() applies a batch and says what changed."""
 
@@ -179,6 +197,9 @@ class FeedRunner:
         self.reserve = reserve
         self.verify_every = verify_every
         self._desired: Set[str] = set(market_ids)
+        self._refused: Set[str] = set()  # joins the server answered with an error this attempt
+        self._last_batch = time.monotonic()
+        self._capped = False
         self.joined: Dict[str, Any] = {}  # market → channel on the current connection
         self.subscribed: Set[str] = set()
         self.healthy = False
@@ -285,6 +306,7 @@ class FeedRunner:
     def _on_batch(self, market_id: str, msg: Dict[str, Any]) -> None:
         if market_id not in self.joined:
             return  # a market we've just left
+        self._last_batch = time.monotonic()
         try:
             changed = self.feed.handle(market_id, msg)
             if changed:
@@ -303,6 +325,7 @@ class FeedRunner:
             self.subscribed.add(market_id)
         else:  # CHANNEL_ERROR, TIMED_OUT, CLOSED: we may have missed batches
             self.subscribed.discard(market_id)
+            self._refused.add(market_id)
             self.feed.need_resync.add(market_id)
             self.feed.stats[f"state_{name.lower()}"] += 1
             if err:
@@ -355,6 +378,7 @@ class FeedRunner:
         time took minutes). A market that won't join is retried after JOIN_RETRY_AFTER."""
         for i in range(0, len(mids), JOIN_BATCH):
             batch = mids[i:i + JOIN_BATCH]
+            self._refused.difference_update(batch)
             for mid in batch:
                 ch = sb.channel(f"tournament:{self.tid}:market:{mid}", {"config": {"private": True}})
                 ch.on_broadcast("market_batch", lambda m, mid=mid: self._on_batch(mid, m))
@@ -366,7 +390,9 @@ class FeedRunner:
             await asyncio.gather(*(self.joined[mid].subscribe(lambda st, err=None, mid=mid: self._on_state(mid, st, err))
                                    for mid in batch))
             deadline = time.monotonic() + JOIN_WAIT
-            while time.monotonic() < deadline and any(mid not in self.subscribed for mid in batch):
+            # Stop waiting once every join has answered: a refused join won't turn into a success.
+            while time.monotonic() < deadline and any(mid not in self.subscribed and mid not in self._refused
+                                                      for mid in batch):
                 await asyncio.sleep(0.1)
             for mid in batch:
                 if mid in self.subscribed:
@@ -382,6 +408,12 @@ class FeedRunner:
             await self._leave(sb, mid)
         now = time.monotonic()
         new = sorted(m for m in desired if m not in self.joined and self._join_after.get(m, 0) <= now)
+        room = MAX_CHANNELS - len(self.joined)
+        if len(new) > room and not self._capped:
+            log.warning("realtime: %d markets wanted, the server allows ~%d per connection: joining %d",
+                        len(desired), MAX_CHANNELS + 5, MAX_CHANNELS)
+            self._capped = True
+        new = new[:max(0, room)]
         if new:
             await self._join(sb, new)
 
@@ -424,15 +456,18 @@ class FeedRunner:
                 # Remember this socket: if it's ever replaced, rebuild everything ourselves.
                 socket = getattr(sb.realtime, "_ws_connection", None)
                 self.healthy = True
+                self._last_batch = time.monotonic()
                 log.info("realtime: subscribed to %d/%d markets", len(self.subscribed), len(self._desired))
                 backoff = 1.0
                 refresh_at = time.monotonic() + TOKEN_REFRESH_SECONDS
                 verify_at = time.monotonic() + self.verify_every
                 while not self._stop.is_set():
-                    if not sb.realtime.is_connected:
+                    if not sb.realtime.is_connected or not _socket_open(sb):
                         raise ConnectionError("socket closed")
                     if getattr(sb.realtime, "_ws_connection", None) is not socket:
                         raise ConnectionError("socket replaced by the library's reconnect")
+                    if self.subscribed and time.monotonic() - self._last_batch > STALL_SECONDS:
+                        raise ConnectionError(f"no updates for {STALL_SECONDS:.0f}s")
                     await self._reconcile(sb)
                     await self._work_resyncs()
                     if time.monotonic() >= verify_at:
