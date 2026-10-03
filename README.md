@@ -171,11 +171,15 @@ so capital turns over instead of waiting for November.
   `DIR_CASH_RESERVE` (2,000) in cash for repairs and exits, and skip orders under `DIR_MIN_ORDER`.
 - **Depth**: `DIR_DEPTH_FRACTION` (0.5) is how much of each shown level an entry may take; raise it to
   take most of a large wall.
-- **Recycling**: when the budget or cash is full, the position with the least expected return left,
-  (fair − sell price) ÷ sell price, is sold to fund a new gap whose return on capital is at least
-  `DIR_RECYCLE_MARGIN` (0.04: a swap pays two spreads) better. Positions bought into during the last 30
-minutes are left alone, and when cash is nearly used up only the single best gap is bought, so small
-top-ups don't get recycled straight back out.
+- **Recycling**: when the budget or cash is full, part of the position with the least return left is
+  sold to fund a better new gap. Both sides are scored by return beyond their bar,
+  (fair − required − price) ÷ price, so a close race's uncertain gap counts for less than a
+  favourite's; the held side is priced at what it sells for now, so the spread to get out is already
+  in the comparison. The new gap must win by `DIR_RECYCLE_MARGIN` (0.04). Only as many shares are sold
+  as the new buy can use (its book depth, race cap and Kelly size, less cash already free), and that
+  cash is spent on the new race in the same cycle, so nothing is sold only to be bought back.
+  Positions bought into during the last 30 minutes are left alone, and when cash is nearly used up
+  only the single best gap is bought. `DIR_RECYCLE_MARGIN=1` switches recycling off.
 
 Only one bot may run per database: a second `sigbot arb` exits with the first one's pid.
 

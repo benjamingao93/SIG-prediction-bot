@@ -88,8 +88,8 @@ class DirectionalConfig:
     depth_fraction: float = 0.5  # share of each shown book level an entry may take (its own setting)
     min_order: float = 25.0  # skip directional orders smaller than this many SUSQies
     cash_reserve: float = 2_000.0  # cash the directional trader always leaves for repairs and exits
-    recycle_margin: float = 0.04  # sell the weakest position to fund a gap this much better (return on
-    # capital). A swap pays two spreads (~1.5-2%), so the bar has to clear that with room to spare.
+    recycle_margin: float = 0.04  # sell (part of) the weakest position to fund a gap this much better
+    # (return on capital beyond each race's bar). 1 switches recycling off.
 
 
 @dataclass(frozen=True)

@@ -198,7 +198,41 @@ def test_recycle_sells_the_weakest_old_position_for_a_better_gap(tmp_path):
     bot._quotes["e4"] = (.42, .43)
     d.step()
     held = d.positions()
-    assert "S-ME" not in held and "S-RI" in held
+    # Only what RI's buy can use (¼-Kelly on a 1,000 budget: ~200) is sold, not the whole position.
+    ri_cost = held["S-RI"]["cost"]
+    sold = 1700 - held["S-ME"]["qty"]
+    assert 0 < ri_cost < 300 and sold == pytest.approx((ri_cost - 22.5) / .57, abs=2)
+
+
+def test_recycle_sells_only_what_the_new_buy_can_take_and_spends_it_there(tmp_path, monkeypatch):
+    fake = FakeOrders()
+    monkeypatch.setattr(directional, "orders", fake)
+    # RI's NO ask has only 400 shares: that's all the new buy can use.
+    books = {"e2": OrderBook("e2", "2", [Level(.07, 400)], [Level(.08, 400)]),
+             "e4": OrderBook("e4", "4", [Level(.44, 5000)], [Level(.45, 5000)])}
+    dcfg = DirectionalConfig(directional=True, live_budget=50_000, live_max_race=10_000, cash_reserve=2_000,
+                             depth_fraction=1.0)
+    d, bot = make(tmp_path, live=True, dcfg=dcfg, books=books)
+    bot.cash = 2_000  # nothing above the reserve
+    old = {"mode": "live", "race": "S-ME", "view": "D", "exchange_id": "e4", "market_id": "4", "title": "",
+           "qty": 8000, "cost": 4600.0, "entry_price": .575, "fair_entry": .593, "halved": 0, "realized": 0.0,
+           "opened": "2026-10-01T00:00:00+00:00"}
+    bot.db.save_dir_position(old)
+    bot._quotes["e4"] = (.42, .43)
+    d.step()
+    sells = [c for c in fake.calls if c[2] == "sell"]
+    buys = [c for c in fake.calls if c[2] == "buy"]
+    assert sells == [("e4", "no", "sell", 653, .57)]  # 400 × .93 = 372 needed → 653 shares at .57
+    assert buys == [("e2", "no", "buy", 400, .93)]  # the freed cash went to RI, this cycle
+    assert d.positions()["S-ME"]["qty"] == 8000 - 653
+
+
+def test_a_close_race_gap_counts_for_less_than_a_favourites(tmp_path):
+    d, bot = make(tmp_path)
+    ri = d._edge("S-RI", "D")
+    # Same raw return on capital, but the bar (min edge + uncertainty) is taken off first.
+    loose = ri.__class__(**{**ri.__dict__, "required": .10})
+    assert d._spare_return(loose, .5) < d._spare_return(ri, .5)
 
 
 def test_recycle_leaves_young_positions_alone(tmp_path):

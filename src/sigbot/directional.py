@@ -66,11 +66,15 @@ class Director:
         ask = self.bot._quotes.get(exchange_id, (None, None))[1]
         return None if ask is None else round(1 - ask, 6)
 
-    def _fair(self, race: str, view: str) -> Optional[float]:
+    def _edge(self, race: str, view: str) -> Optional[Edge]:
         for e in self.bot._edges:
             if e.race == race and e.view == view and "kalshi" in e.fv.sources:
-                return e.fair  # only trust Kalshi-backed fair values for exits too
+                return e  # only trust Kalshi-backed fair values for exits too
         return None
+
+    def _fair(self, race: str, view: str) -> Optional[float]:
+        e = self._edge(race, view)
+        return e.fair if e else None
 
     def unrealized(self, positions: Dict[str, Dict[str, Any]]) -> float:
         total = 0.0
@@ -111,7 +115,8 @@ class Director:
                                              and self.max_race - held[e.race]["cost"] >= self.cfg.min_order))]
         cands.sort(key=lambda e: -(e.edge / e.price))
         if cands and self.room(held) < max(self.cfg.min_order, min(self.max_race, 1000.0)):
-            self._recycle(cands[0], held)
+            if self._recycle(cands[0], held):
+                cands = cands[:1]  # the freed cash is for the race it was freed for, nothing else
             held = self.positions()
         if self.live and self.bot.cash - self.cfg.cash_reserve < max(self.cfg.min_order, 1000.0):
             cands = cands[:1]  # nearly out of cash: no small top-ups that recycling would undo
@@ -128,16 +133,33 @@ class Director:
             left = min(left, self.bot.cash - self.cfg.cash_reserve)
         return max(0.0, left)
 
-    def remaining_return(self, p: Dict[str, Any]) -> Optional[float]:
-        """Expected return still left in a position if held: (fair − sell price) ÷ sell price."""
-        fair, px = self._fair(p["race"], p["view"]), self.sell_price(p["exchange_id"])
-        if fair is None or not px:
-            return None
-        return (fair - px) / px
+    @staticmethod
+    def _spare_return(e: Edge, price: float) -> float:
+        """Return on capital beyond the race's bar: (fair − required − price) ÷ price. The bar grows
+        with the fair value's uncertainty, so a close race's gap counts for less than a favourite's."""
+        return (e.fair - e.required - price) / price
 
-    def _recycle(self, best: Edge, held: Dict[str, Dict[str, Any]]) -> None:
-        """Budget or cash is full: sell the position with the least return left if the best new
-        gap beats it by recycle_margin. Positions bought into in the last 30 minutes are left alone."""
+    def remaining_return(self, p: Dict[str, Any]) -> Optional[float]:
+        """What holding a position still earns beyond its bar, per SUSQie it would sell for now. The
+        sell price is the bid, so the spread paid to get out is already in the comparison."""
+        e, px = self._edge(p["race"], p["view"]), self.sell_price(p["exchange_id"])
+        if e is None or not px:
+            return None
+        return self._spare_return(e, px)
+
+    def _recycle(self, best: Edge, held: Dict[str, Dict[str, Any]]) -> bool:
+        """Budget or cash is full: sell part of the position with the least return left, if the best
+        new gap beats it by recycle_margin. Only as many shares as the new buy can use (its book depth,
+        race cap and Kelly size, less the cash already free), so nothing is sold that would just be
+        bought back. Positions bought into in the last 30 minutes are left alone. True if it sold."""
+        plan = self._plan(best, held, ignore_room=True)
+        if plan is None:
+            return False
+        qty, _, cost, _ = plan
+        need = cost - self.room(held)
+        if need < self.cfg.min_order:
+            return False
+        best_r = self._spare_return(best, cost / qty)  # at the average price the buy would pay
         now = time.time()
         scored = []
         for p in held.values():
@@ -148,12 +170,14 @@ class Director:
             if r is not None and age >= 1800:
                 scored.append((r, p))
         if not scored:
-            return
+            return False
         weakest_r, weakest = min(scored, key=lambda x: x[0])
-        if best.edge / best.price - weakest_r < self.cfg.recycle_margin:
-            return
+        if best_r - weakest_r < self.cfg.recycle_margin:
+            return False
         px = self.sell_price(weakest["exchange_id"])
-        self._sell(weakest, weakest["qty"], px, f"recycle into {best.race} ({best.edge / best.price:.1%} vs {weakest_r:.1%} left)")
+        shares = min(weakest["qty"], math.ceil(need / px))
+        return self._sell(weakest, shares, px,
+                          f"recycle {shares} into {best.race} ({best_r:.1%} vs {weakest_r:.1%} left beyond the bar)")
 
     # ---- exits ----
 
@@ -172,10 +196,10 @@ class Director:
             self._sell(p, math.floor(p["qty"] / 2), px, f"take half: {px:.3f} closed half the gap to {fair:.3f}",
                        halved=True)
 
-    def _sell(self, p: Dict[str, Any], qty: float, px: float, why: str, halved: bool = False) -> None:
+    def _sell(self, p: Dict[str, Any], qty: float, px: float, why: str, halved: bool = False) -> bool:
         qty = int(qty)
         if qty < 1:
-            return
+            return False
         if self.live:
             self._writes += 1
             try:
@@ -183,13 +207,15 @@ class Director:
                                        ttl_seconds=self.bot.cfg.order_ttl)
             except SigAPIError as e:
                 log.error("directional sell %s rejected: %s", p["race"], e)
-                return
+                return False
             got = self.bot._settle_leg(r)
             proceeds = abs(float(r.get("totalCost") or 0)) or got * px
         else:
             got, proceeds = qty, qty * px
         if got < 1:
-            return
+            return False
+        if self.live:
+            self.bot.cash += proceeds  # spendable this cycle, as buys already subtract their cost
         cost_out = p["entry_price"] * got
         realized = proceeds - cost_out
         p = {**p, "qty": p["qty"] - got, "cost": p["cost"] - cost_out, "realized": p["realized"] + realized,
@@ -203,30 +229,45 @@ class Director:
         self._log(p, "sell", got, px, realized / got)
         log.info("%s DIRECTIONAL SELL %s %s: %d NO at %.3f, %+.2f (%s)", self.mode.upper(), p["race"], p["view"],
                  got, px, realized, why)
+        return True
 
     # ---- entries ----
 
-    def _enter(self, e: Edge, held: Dict[str, Dict[str, Any]]) -> None:
+    def _plan(self, e: Edge, held: Dict[str, Dict[str, Any]], ignore_room: bool = False):
+        """(shares, worst price, cost, read time) a buy of this edge would make now, or None.
+        ignore_room: size as if budget and cash were no limit (what recycling would need to free)."""
         books, read_at = self.bot._books([e.buy_exchange])
         ladder = books[e.buy_exchange].no_asks()
         walk = arb._walk([ladder], lambda prices: e.fair - prices[0], e.required, 10 ** 9,
                          self.cfg.depth_fraction)
         if not walk:
-            return
+            return None
         depth_qty, (limit,), total = walk
         have = held.get(e.race)
-        room = min(self.max_race - (have["cost"] if have else 0.0), self.room(held))
+        room = self.max_race - (have["cost"] if have else 0.0)
+        if not ignore_room:
+            room = min(room, self.room(held))
         net = self.net_direction(held)
         sign = 1 if e.view == "D" else -1
         room = min(room, max(0.0, self.cfg.max_net - sign * net))  # how far this side may still go
         kelly = kelly_shares(e.fair, total / depth_qty, self.budget, self.cfg.kelly_fraction) - (have["qty"] if have else 0)
         qty = min(depth_qty, kelly,
                   int(room // limit) if limit > 0 else 0)
-        if qty < 1 or qty * limit < self.cfg.min_order or self.bot._stale(read_at, f"directional {e.race}"):
-            return
+        if qty < 1 or qty * limit < self.cfg.min_order:
+            return None
         # Re-walk for exactly qty shares: the cost and the worst level we actually need.
         _, (limit,), cost = arb._walk([ladder], lambda prices: e.fair - prices[0], e.required, qty,
                                       self.cfg.depth_fraction)
+        return qty, limit, cost, read_at
+
+    def _enter(self, e: Edge, held: Dict[str, Dict[str, Any]]) -> None:
+        plan = self._plan(e, held)
+        if plan is None:
+            return
+        qty, limit, cost, read_at = plan
+        if self.bot._stale(read_at, f"directional {e.race}"):
+            return
+        have = held.get(e.race)
         if self.live:
             self._writes += 1
             try:
