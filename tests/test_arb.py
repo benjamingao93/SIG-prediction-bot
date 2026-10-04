@@ -369,3 +369,20 @@ def test_exit_only_sells_but_never_buys(monkeypatch, tmp_path):
     bot.cfg = ArbConfig(exit_only=True)
     bot.step()
     assert len(fake.calls) == 1 and fake.calls[0][0]["action"] == "sell"  # the exit, and no buy
+
+
+def test_no_arb_buys_still_exits_and_runs_the_directional_trader(monkeypatch, tmp_path):
+    quotes = [{"exchangeId": "e1", "bestBid": .62, "bestAsk": .61}, {"exchangeId": "e2", "bestBid": .40, "bestAsk": .385}]
+    books = {"e1": book("e1", bids=[(.62, 1000)], asks=[(.61, 1000)]),
+             "e2": book("e2", bids=[(.40, 1000)], asks=[(.385, 1000)])}
+    bot, fake, _ = live_bot(monkeypatch, tmp_path, [[50, 50]], books)
+    monkeypatch.setattr(arb_bot.mk, "bulk_prices", lambda c, ids, tid: quotes)
+    bot.baskets = [two_leg_basket()]
+    bot.held, bot.held_cost = {"S-TX": 50}, {"S-TX": .99}
+    bot._last_refresh, bot._last_trade, bot._quotes = time.monotonic(), {}, {}
+    stepped = []
+    bot.director = SimpleNamespace(step=lambda: stepped.append(1))
+    bot.cfg = ArbConfig(buys=False)
+    bot.step()
+    assert len(fake.calls) == 1 and fake.calls[0][0]["action"] == "sell"  # the exit, and no new basket
+    assert stepped  # directional still ran

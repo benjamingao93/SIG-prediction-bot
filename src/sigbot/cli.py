@@ -14,6 +14,7 @@
   sigbot arb --quote           also rest passive quotes (paper: simulated fills; add --live for real)
   sigbot arb --feed            realtime books for the races that matter, so trades don't wait on reads
   sigbot arb --exit-only       only sell baskets (and finish repairs): frees capital, buys nothing
+  sigbot arb --no-arb-buys     no new baskets or quotes; basket exits, repairs and --directional carry on
   sigbot arb --directional     also bet against SIG's mispricings vs Kalshi + ratings (short holds)
   sigbot arb --live --directional-paper   live arbitrage, directional trader simulated alongside
   sigbot hedge RACE --max-price P   have the arb bot finish hedging an uneven race (NO side)
@@ -182,6 +183,8 @@ def cmd_arb(s: Settings, a) -> None:
         s = replace(s, arb=replace(s.arb, feed=True))
     if a.exit_only:
         s = replace(s, arb=replace(s.arb, exit_only=True))
+    if a.no_arb_buys:
+        s = replace(s, arb=replace(s.arb, buys=False))
     if a.directional or a.directional_paper:
         s = replace(s, dir=replace(s.dir, directional=True, paper=a.directional_paper))
     if s.arb.exit_only and not s.arb.exit_enabled:
@@ -308,6 +311,8 @@ def main(argv=None) -> None:
     ar.add_argument("--quote", action="store_true", help="rest passive quotes (paper unless --live)")
     ar.add_argument("--feed", action="store_true", help="realtime books for watched races (needs .[realtime])")
     ar.add_argument("--exit-only", action="store_true", help="sell held baskets and finish repairs; buy nothing new")
+    ar.add_argument("--no-arb-buys", action="store_true",
+                    help="buy no new baskets and rest no quotes; exits, repairs and --directional carry on")
     ar.add_argument("--directional", action="store_true",
                     help="bet where SIG disagrees with Kalshi + ratings (paper unless --live; live budget DIR_LIVE_BUDGET)")
     ar.add_argument("--directional-paper", action="store_true",

@@ -86,6 +86,7 @@ Exits capture the same mispricing without that risk, because they only close NO 
 sigbot arb            # paper: logs the baskets it would buy
 sigbot arb --live     # real orders; also needs MODE=live in .env
 sigbot arb --live --exit-only   # sell baskets and finish repairs only: frees capital, buys nothing
+sigbot arb --live --directional --no-arb-buys   # directional only: no new baskets or quotes (exits and repairs go on)
 sigbot dashboard      # http://localhost:8050
 ```
 

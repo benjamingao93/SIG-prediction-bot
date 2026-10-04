@@ -238,8 +238,8 @@ class ArbBot:
             traded += self._exits(quotes)
         if self.director is not None:
             self.director.step()  # its exits always run; its entries respect --exit-only itself
-        if self.cfg.exit_only:
-            return traded  # exits and repairs only: no new baskets, no quotes
+        if self.cfg.exit_only or not self.cfg.buys:
+            return traded  # exits and repairs (and, with --no-arb-buys, directional): no new baskets, no quotes
         if self.quoter:
             self.quoter.step(quotes, {str(r["exchangeId"]): r.get("latestPrice") for r in rows})
         flagged = []
