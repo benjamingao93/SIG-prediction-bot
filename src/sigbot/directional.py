@@ -225,10 +225,14 @@ class Director:
             self._sell(p, p["qty"], px, f"take profit: {px:.3f} reached fair {fair:.3f}")
         elif (not p["halved"] and px > entry and fair > entry
               and px >= entry + self.cfg.take_half_at * (fair - entry) and p["qty"] >= 2):
-            self._sell(p, math.floor(p["qty"] / 2), px, f"take half: {px:.3f} closed half the gap to {fair:.3f}",
-                       halved=True)
+            # Keep half of the position as it was when this first triggered: retries after a partial
+            # fill sell down to that, not half of whatever is left each time.
+            keep = p.get("half_keep") or math.ceil(p["qty"] / 2)
+            self._sell(p, p["qty"] - keep, px, f"take half: {px:.3f} closed half the gap to {fair:.3f}",
+                       halved=True, keep=keep)
 
-    def _sell(self, p: Dict[str, Any], qty: float, px: float, why: str, halved: bool = False) -> int:
+    def _sell(self, p: Dict[str, Any], qty: float, px: float, why: str, halved: bool = False,
+              keep: Optional[float] = None) -> int:
         """Sell up to qty NO at px or better; the shares sold."""
         qty = int(qty)
         if qty < 1:
@@ -252,8 +256,10 @@ class Director:
         cost_out = p["entry_price"] * got
         realized = proceeds - cost_out
         p = {**p, "qty": p["qty"] - got, "cost": p["cost"] - cost_out, "realized": p["realized"] + realized,
-             # A half sale only counts once it fully fills; a partial fill tries again next cycle.
-             "halved": 1 if (halved and got >= qty) or p["halved"] else 0}
+             # A half sale is done once the position is down to the shares it keeps; until then
+             # (a partial fill) the next cycle sells the rest of that half.
+             "halved": 1 if p["halved"] or (halved and p["qty"] - got <= keep) else 0,
+             "half_keep": keep if halved else p.get("half_keep")}
         self.bot.db.add_dir_realized(self.mode, realized)
         if p["qty"] < 1:
             self.bot.db.close_dir_position(self.mode, p["race"])
@@ -322,7 +328,7 @@ class Director:
         if have:  # top-up: one position per race, entry price averaged over all buys
             p = {**have, "qty": have["qty"] + got, "cost": have["cost"] + cost,
                  "entry_price": (have["cost"] + cost) / (have["qty"] + got), "fair_entry": e.fair,
-                 "last_buy": bought_at}
+                 "last_buy": bought_at, "half_keep": None}  # a top-up resets an unfinished half sale
         else:
             p = {"mode": self.mode, "race": e.race, "view": e.view, "exchange_id": e.buy_exchange,
                  "market_id": market.market_id if market else None, "title": market.title if market else "",

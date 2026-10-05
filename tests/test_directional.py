@@ -321,6 +321,10 @@ def test_a_partly_filled_half_sale_is_tried_again(tmp_path, monkeypatch):
     assert after["qty"] == p["qty"] - 51 and after["halved"] == 0  # not done: try again
     d._manage(after)
     assert d.positions()["S-RI"]["qty"] == p["qty"] - 102
+    for _ in range(200):  # keep retrying: it stops at half the original position, never below
+        d._manage(d.positions()["S-RI"])
+    final = d.positions()["S-RI"]
+    assert final["qty"] == -(-p["qty"] // 2) and final["halved"] == 1
 
 
 def test_manual_sell_from_the_dashboard_sells_to_the_floor_and_blocks_the_race(tmp_path, monkeypatch):
