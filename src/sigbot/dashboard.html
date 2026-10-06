@@ -133,6 +133,10 @@ button:disabled { opacity: .5; cursor: default; }
       <div id="dir-sell"></div>
       <div id="dir-manual"></div>
     </section>
+    <section class="panel" id="mm-panel" style="display:none">
+      <h2>Market making <span id="mm-note"></span></h2>
+      <div class="scroll" id="mm"></div>
+    </section>
     <section class="panel" id="edges-panel" style="display:none">
       <h2>Fair value vs SIG <span id="edges-note"></span></h2>
       <div class="scroll" id="edges"></div>
@@ -265,6 +269,22 @@ function render(d) {
   }
   renderManual(L, D);
 
+  // market making (sigbot arb --mm): paper fills, no orders
+  const M = S?.mm;
+  $("mm-panel").style.display = M ? "" : "none";
+  if (M) {
+    $("mm-note").textContent = `${M.mode} · ${M.markets} markets · ${num(M.fills)} fills · ` +
+      `banked ${M.realized >= 0 ? "+" : ""}${num(M.realized, 2)} · open ${M.unrealized >= 0 ? "+" : ""}${num(M.unrealized, 2)}`;
+    $("mm").innerHTML = table(
+      [["Race"], ["Party"], ["Fair", "num"], ["Book", "num"], ["Our quotes", "num"], ["Net YES", "num"], ["Pairs", "num"], ["Banked", "num"], [""]],
+      M.rows.map((r) => `<tr><td>${esc(r.race)}</td><td>${esc(r.party)}</td><td class="num">${num(r.fair, 3)}</td>` +
+        `<td class="num">${num(r.book_bid, 3)} / ${num(r.book_ask, 3)}</td>` +
+        `<td class="num">${r.our_bid == null ? "–" : num(r.our_bid, 3)} / ${r.our_ask == null ? "–" : num(r.our_ask, 3)}</td>` +
+        `<td class="num">${signed(r.net, 0)}</td><td class="num">${num(r.pairs)}</td><td class="num">${signed(r.realized)}</td>` +
+        `<td>${r.chosen ? "" : '<span class="tag paper">unwinding</span>'}</td></tr>`),
+      "No markets chosen yet (needs fresh Kalshi fair values and a wide enough book).");
+  }
+
   // fair value vs SIG (last `sigbot edges` snapshot)
   const E = L.edges;
   $("edges-panel").style.display = E ? "" : "none";
@@ -304,6 +324,7 @@ function render(d) {
         o.status === "sent" ? '<span class="tag ok">sent</span>' :
         o.status === "exit" ? '<span class="tag ok">exit</span>' :
         /^dir-/.test(o.status) ? '<span class="tag paper">directional</span>' :
+        o.status === "mm-fill" ? '<span class="tag paper">mm (paper)</span>' :
         o.status === "quote" ? '<span class="tag paper">quote</span>' :
         /quote-fill/.test(o.status) ? '<span class="tag ok">quote fill</span>' :
         o.status === "repair" ? '<span class="tag paper">repair</span>' : `<span class="tag err">${esc(o.status)}</span>`;

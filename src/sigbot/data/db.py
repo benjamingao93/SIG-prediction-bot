@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS dir_manual (
     id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, mode TEXT, race TEXT, qty REAL, min_price REAL,
     block INTEGER DEFAULT 1, status TEXT DEFAULT 'pending', sold REAL DEFAULT 0, note TEXT, done TEXT
 );
+CREATE TABLE IF NOT EXISTS mm_state (
+    mode TEXT, exchange_id TEXT, race TEXT, party TEXT, data TEXT, updated TEXT, PRIMARY KEY (mode, exchange_id)
+);
 CREATE TABLE IF NOT EXISTS dir_blocked (
     mode TEXT, race TEXT, created TEXT, PRIMARY KEY (mode, race)
 );
@@ -274,6 +277,17 @@ class DB:
 
     def blocked_races(self, mode: str) -> Set[str]:
         return {r["race"] for r in self.conn.execute("SELECT race FROM dir_blocked WHERE mode = ?", (mode,))}
+
+    # ---- market making: inventory per market ----
+
+    def mm_states(self, mode: str) -> Dict[str, Dict[str, Any]]:
+        return {r["exchange_id"]: {"race": r["race"], "party": r["party"], **json.loads(r["data"])}
+                for r in self.conn.execute("SELECT * FROM mm_state WHERE mode = ?", (mode,))}
+
+    def save_mm_state(self, mode: str, exchange_id: str, race: str, party: str, data: Dict[str, Any]) -> None:
+        self.conn.execute("INSERT OR REPLACE INTO mm_state VALUES (?,?,?,?,?,?)",
+                          (mode, exchange_id, race, party, json.dumps(data), now_iso()))
+        self.conn.commit()
 
     def set_edges(self, data: Any) -> None:
         self.conn.execute("INSERT OR REPLACE INTO edges_snapshot VALUES (1, ?, ?)", (now_iso(), json.dumps(data)))

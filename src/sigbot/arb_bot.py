@@ -84,6 +84,10 @@ class ArbBot:
             # Shares this client, so its reloads count against the same budget; keep 10 free.
             self.feed = FeedRunner(client, self.tid, reserve=10)
             self.feed.on_fills = self._wake.set
+        self.mm = None
+        if s.mm.enabled:
+            from .market_maker import MarketMaker
+            self.mm = MarketMaker(self)  # paper: simulated fills, never sends orders
         self.quoter = None
         if self.cfg.quoting and not self.cfg.exit_only:
             from .quoter import Quoter
@@ -218,6 +222,7 @@ class ArbBot:
         ex_ids = [l.exchange_id for b in self.baskets for l in b.legs]
         rows = mk.bulk_prices(self.client, ex_ids, self.tid)
         quotes = arb.quotes_from_prices(rows)
+        lasts = {str(r["exchangeId"]): r.get("latestPrice") for r in rows}  # last trade per market
         if self.feed is not None:
             # Feed prices are newer than the poll for the markets it watches.
             quotes.update({ex: (b.best_bid, b.best_ask) for ex, b in list(self.feed.store.books.items())
@@ -230,18 +235,20 @@ class ArbBot:
             if (self._edges and self.fair.fresh()
                     and time.monotonic() - self._history_at >= self.s.dir.history_every):
                 self._history_at = time.monotonic()
-                rows = [e.as_row() for e in self._edges]
-                self.db.insert_edges_history(rows)
-                self.db.set_edges(rows)
+                hist = [e.as_row() for e in self._edges]
+                self.db.insert_edges_history(hist)
+                self.db.set_edges(hist)
         traded = 0
         if self.cfg.exit_enabled:
             traded += self._exits(quotes)
         if self.director is not None:
             self.director.step()  # its exits always run; its entries respect --exit-only itself
+        if self.mm is not None:
+            self.mm.step(quotes, lasts)
         if self.cfg.exit_only or not self.cfg.buys:
             return traded  # exits and repairs (and, with --no-arb-buys, directional): no new baskets, no quotes
         if self.quoter:
-            self.quoter.step(quotes, {str(r["exchangeId"]): r.get("latestPrice") for r in rows})
+            self.quoter.step(quotes, lasts)
         flagged = []
         for b in self.baskets:
             if b.key in self.repairs:
@@ -513,6 +520,7 @@ class ArbBot:
             "exits": self.exits, "exit_enabled": self.cfg.exit_enabled, "exit_only": self.cfg.exit_only,
             "quoting": self.quoter.status(self._quotes) if self.quoter else None,
             "directional": self.director.status() if self.director else None,
+            "mm": self.mm.status(self._quotes) if self.mm else None,
             "feed": None if self.feed is None else {
                 "healthy": self.feed.healthy, "watching": len(self.feed.market_ids),
                 "subscribed": len(self.feed.subscribed), "hits": self.feed_hits, "misses": self.feed_misses,

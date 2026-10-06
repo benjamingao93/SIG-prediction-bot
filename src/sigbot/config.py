@@ -95,6 +95,19 @@ class DirectionalConfig:
 
 
 @dataclass(frozen=True)
+class MMConfig:
+    """Market making on single markets around the fair value (`sigbot arb --mm`). Paper only for now."""
+    enabled: bool = False
+    markets: int = 5  # markets quoted at once, one per race
+    size: float = 200.0  # shares per quote
+    edge: float = 0.01  # each quote stays at least this far from fair value
+    max_inv: float = 1000.0  # most net YES (or NO) shares held in one market; that side stops quoting
+    skew: float = 0.01  # quotes shift this far against a full inventory, so it unwinds
+    writes_per_cycle: int = 2  # quote placements a cycle may use (paper counts them too)
+    reselect: float = 300.0  # seconds between choosing markets
+
+
+@dataclass(frozen=True)
 class Settings:
     api_key: str
     base_url: str
@@ -112,6 +125,7 @@ class Settings:
     arb: ArbConfig
     dir: DirectionalConfig = DirectionalConfig()
     kalshi_map_path: Path = Path("data/kalshi_map.csv")
+    mm: MMConfig = MMConfig()
 
 
 def _f(name: str, default: Optional[float]) -> Optional[float]:
@@ -191,6 +205,17 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         cash_reserve=_f("DIR_CASH_RESERVE", dd.cash_reserve),
         recycle_margin=_f("DIR_RECYCLE_MARGIN", dd.recycle_margin),
     )
+    m = MMConfig()
+    mm = MMConfig(
+        enabled=os.environ.get("MM_ENABLED", "").strip().lower() in ("1", "true", "yes"),
+        markets=int(_f("MM_MARKETS", m.markets)),
+        size=_f("MM_SIZE", m.size),
+        edge=_f("MM_EDGE", m.edge),
+        max_inv=_f("MM_MAX_INV", m.max_inv),
+        skew=_f("MM_SKEW", m.skew),
+        writes_per_cycle=int(_f("MM_WRITES_PER_CYCLE", m.writes_per_cycle)),
+        reselect=_f("MM_RESELECT", m.reselect),
+    )
     return Settings(
         api_key=api_key,
         base_url=os.environ.get("SIG_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -208,4 +233,5 @@ def load_settings(env_file: str = ".env", require_key: bool = True) -> Settings:
         arb=arb,
         dir=directional,
         kalshi_map_path=Path(os.environ.get("KALSHI_MAP_PATH", "data/kalshi_map.csv")),
+        mm=mm,
     )
